@@ -1,0 +1,274 @@
+import torch, numpy as np, pandas as pd
+import torch.nn as nn
+from typing import List, Dict, Optional
+
+from sem_set_transformer_cov import (
+    TokenEncoderCov, EquivariantBackbone, MAB, LossWeights,
+    sample_random_dag_and_params, simulate_samples_cov, empirical_covs
+)
+
+# ----------------------------
+# ICL Set Transformer (Query ← Supports), covariance tokens
+# ----------------------------
+class ICLSetTransformerCov(nn.Module):
+    def __init__(self, p: int, d_model: int = 128, n_heads: int = 8, d_ff: int = 256, depth: int = 3,
+                 r_sigma: int = 32, mlp_hidden: int = 128, dropout: float = 0.0,
+                 use_isab: bool = True, m_induce: int = 256, max_R: int = 160):
+        super().__init__()
+        self.p = p
+        self.encoder = TokenEncoderCov(p, r_sigma, d_model, mlp_hidden)
+        self.backbone = EquivariantBackbone(d_model, n_heads, d_ff, depth, dropout, use_isab, m_induce)
+        self.cross = MAB(d_model, n_heads, d_ff, dropout)  # Query ← Support
+        self.role_embed = nn.Embedding(2, d_model)         # 0=support, 1=query
+        self.prompt_embed = nn.Embedding(max_R, d_model)   # id per support prompt
+        self.cls_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # y: support prob
+        self.reg_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # r: normalized bump
+
+    def encode_sem(self, mu_obs, mu_int, Sigma_obs, Sigma_int, role_id: int, prompt_id: Optional[int] = None):
+        X = self.encoder(mu_obs, mu_int, Sigma_obs, Sigma_int)  # (1, p, d)
+        X = X + self.role_embed.weight[role_id].view(1, 1, -1).expand(1, self.p, -1)
+        if prompt_id is not None:
+            X = X + self.prompt_embed.weight[prompt_id % self.prompt_embed.num_embeddings].view(1, 1, -1).expand(1, self.p, -1)
+        return X
+
+    def forward_episode(self, supports: List[Dict], query: Dict):
+        S_list = []
+        for r, s in enumerate(supports):
+            Xs = self.encode_sem(s["mu_obs"], s["mu_int"], s["Sigma_obs"], s["Sigma_int"], role_id=0, prompt_id=r)
+            S_list.append(Xs)
+        S = torch.cat(S_list, dim=1) if len(S_list) > 0 else None
+        Q = self.encode_sem(query["mu_obs"], query["mu_int"], query["Sigma_obs"], query["Sigma_int"], role_id=1)
+
+        if S is not None:
+            S = self.backbone(S)
+        Q = self.backbone(Q)
+
+        if S is not None:
+            Q = self.cross(Q, S)  # Query attends to all supports
+
+        logits = self.cls_head(Q).squeeze(0).squeeze(-1)  # (p,)
+        p_q = torch.sigmoid(logits)
+        r_hat = self.reg_head(Q).squeeze(0).squeeze(-1)   # (p,)
+        return p_q, r_hat
+
+
+# ----------------------------
+# Episode generator: covariance perturbation (D = c·I; v is s-sparse with fixed magnitude m)
+# ----------------------------
+def make_icl_episode_cov(R: int, p: int, n_obs: int, n_int: int, s: int,
+                         c: float, mag: float,
+                         seed: Optional[int] = None):
+    """
+    One episode (R supports + 1 query) sharing B and D=cI.
+    Each prompt uses an s-sparse vector v with nonzeros = mag (manual magnitude).
+    """
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+
+    # Shared SEM (B, D) for the whole episode
+    B, D = sample_random_dag_and_params(p, exp_degree=3.0, c=c, seed=(None if seed is None else seed + 7))
+
+    def make_one(local_seed: Optional[int]):
+        gl = torch.Generator()
+        if local_seed is not None:
+            gl.manual_seed(local_seed)
+
+        idx = torch.randperm(p, generator=gl)[:s]
+        v = torch.zeros(p)
+        v[idx] = mag  # fixed manual magnitude on the support set
+
+        X_obs = simulate_samples_cov(B, D, n_obs, v=None, seed=local_seed)
+        X_int = simulate_samples_cov(B, D, n_int, v=v,   seed=(None if local_seed is None else local_seed + 1))
+        mu_obs, mu_int, Sigma_obs, Sigma_int = empirical_covs(X_obs, X_int, eps_reg=1e-3)
+
+        y = (v != 0).float()          # support indicator
+        r_star = v / torch.diag(D)    # normalized bump: v/c (since D=cI)
+        return {
+            "mu_obs": mu_obs,
+            "mu_int": mu_int,
+            "Sigma_obs": Sigma_obs,
+            "Sigma_int": Sigma_int,
+            "y": y,
+            "r_star": r_star,
+            "v": v,
+            "B": B,
+            "D": D,
+        }
+
+    supports = [make_one(local_seed=(None if seed is None else seed + 100 * r)) for r in range(R)]
+    query = make_one(local_seed=(None if seed is None else seed + 9999))
+    return supports, query
+
+
+# ----------------------------
+# Train on covariance episodes (ICL)
+# ----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+# Problem setup
+p = 64
+R = 100       # shots (supports) per episode; reduce if you hit OOM
+s = 3
+n_obs = 512
+n_int = 512
+
+c_choices   = [0.2, 0.4, 0.6, 0.8, 1.0]  # D = c I
+mag_choices = [0.2, 0.4, 0.6, 0.8, 1.0]  # manual bump magnitude
+
+model = ICLSetTransformerCov(
+    p=p, d_model=128, n_heads=8, d_ff=256, depth=3,
+    r_sigma=32, mlp_hidden=128, dropout=0.0,
+    use_isab=True, m_induce=256, max_R=160
+).to(device)
+
+opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200)
+weights = LossWeights(alpha=1.0, beta=1.0)
+
+steps = 3000  # training steps
+for t in range(steps):
+    c = float(np.random.choice(c_choices))
+    mag = float(np.random.choice(mag_choices))
+
+    opt.zero_grad()
+    supports, query = make_icl_episode_cov(R=R, p=p, n_obs=n_obs, n_int=n_int, s=s,
+                                           c=c, mag=mag, seed=t)
+
+    for spt in supports:
+        for k in ["mu_obs", "mu_int", "Sigma_obs", "Sigma_int", "y", "r_star"]:
+            spt[k] = spt[k].to(device)
+    for k in ["mu_obs", "mu_int", "Sigma_obs", "Sigma_int", "y", "r_star"]:
+        query[k] = query[k].to(device)
+
+    p_q, r_hat = model.forward_episode(supports, query)
+
+    loss_bce = nn.functional.binary_cross_entropy(p_q.clamp(1e-6, 1 - 1e-6), query["y"])
+    loss_mse = nn.functional.mse_loss(r_hat, query["r_star"])
+    loss = weights.alpha * loss_bce + weights.beta * loss_mse
+    loss.backward()
+    opt.step(); sched.step()
+
+    if (t + 1) % 10 == 0:
+        print(f"step {t+1:03d} | loss={loss.item():.4f} | bce={loss_bce.item():.4f} | mse={loss_mse.item():.4f}")
+
+
+# ----------------------------
+# Evaluate grid & save Summary + Details to Excel
+# zero_one_loss (cov): avg # of true indices in top-s by |r_hat|  ∈ [0, s]
+# ----------------------------
+@torch.no_grad()
+def eval_grid_cov_both(model, R, p, n_obs, n_int, s, c_values, mag_values,
+                       trials=20, k_z=5):
+    device = next(model.parameters()).device
+    summary_rows, details_rows = [], []
+
+    for c in c_values:
+        for mag in mag_values:
+            TP = FP = 0
+            mses = []
+            hits5 = 0
+            hits_s_by_z_sum = 0
+
+            for i in range(trials):
+                supports, query = make_icl_episode_cov(
+                    R=R, p=p, n_obs=n_obs, n_int=n_int, s=s,
+                    c=c, mag=mag, seed=12345 + i
+                )
+
+                for spt in supports:
+                    for k in ["mu_obs", "mu_int", "Sigma_obs", "Sigma_int", "y", "r_star"]:
+                        spt[k] = spt[k].to(device)
+                for k in ["mu_obs", "mu_int", "Sigma_obs", "Sigma_int", "y", "r_star"]:
+                    query[k] = query[k].to(device)
+
+                p_q, r_hat = model.forward_episode(supports, query)
+
+                true_idx = torch.nonzero(query["y"], as_tuple=False).view(-1)
+                true_set = set(true_idx.tolist())
+                k_s = min(s, p)
+
+                # metrics by p̂
+                pred_idx_s_by_p = torch.topk(p_q, k=k_s).indices
+                pred_set_by_p = set(pred_idx_s_by_p.tolist())
+                hits_s_by_p = len(pred_set_by_p & true_set)
+                TP += hits_s_by_p
+                FP += (k_s - hits_s_by_p)
+
+                # hits@5 by p̂
+                k5 = min(5, p)
+                pred_idx_5 = torch.topk(p_q, k=k5).indices
+                hits5 += len(set(pred_idx_5.tolist()) & true_set)
+
+                # metrics by |r_hat| for 0/1 (cov)
+                r_np = r_hat.detach().cpu().numpy()
+                order_by_abs_r = np.argsort(-np.abs(r_np))
+                pred_idx_s_by_z = order_by_abs_r[:k_s].tolist()
+                pred_set_by_z = set(pred_idx_s_by_z)
+                hits_s_by_z = len(pred_set_by_z & true_set)
+                hits_s_by_z_sum += hits_s_by_z
+
+                # regression MSE
+                mses.append(float(nn.functional.mse_loss(r_hat, query["r_star"]).cpu()))
+
+                # details
+                details_rows.append({
+                    "c": float(c),
+                    "magnitude": float(mag),
+                    "trial": int(i),
+                    "true_support": sorted(list(true_set)),
+                    "v": query["v"].tolist(),  # stays on CPU from generator
+                    "pred_top_s_by_p": sorted(list(pred_set_by_p)),
+                    "hits_s_by_p": int(hits_s_by_p),
+                    "pred_top_s_by_z": sorted(list(pred_set_by_z)),
+                    "hits_s_by_z": int(hits_s_by_z),
+                    "topk_r_idx": order_by_abs_r[:min(k_z, p)].astype(int).tolist(),
+                    "topk_r_val": r_np[order_by_abs_r[:min(k_z, p)]].tolist(),
+                    "is_exact_match_by_z": bool(pred_set_by_z == true_set),
+                })
+
+            precision = TP / max(1, TP + FP)               # by p̂
+            zero_one_loss = hits_s_by_z_sum / float(trials) # avg hits in top-s by |r_hat| (0..s)
+
+            summary_rows.append({
+                "c": float(c),
+                "magnitude": float(mag),
+                "precision": float(precision),
+                "mse": float(np.mean(mses)),
+                "hits_at_5": hits5 / float(trials),
+                "zero_one_loss": float(zero_one_loss),
+            })
+
+    return pd.DataFrame(summary_rows), pd.DataFrame(details_rows)
+
+
+# ---- Run the grid
+c_values   = [0.2, 0.4, 0.6, 0.8, 1.0]
+mag_values = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+summary_df, details_df = eval_grid_cov_both(
+    model, R=R, p=p, n_obs=n_obs, n_int=n_int, s=s,
+    c_values=c_values, mag_values=mag_values,
+    trials=20, k_z=5
+)
+
+# ---- Save to Excel + CSVs
+try:
+    import openpyxl  # noqa
+except Exception:
+    !pip -q install openpyxl
+    import openpyxl  # noqa
+
+excel_path = "cov_icl_summary_and_details.xlsx"
+with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+    summary_df.sort_values(["c", "magnitude"]).to_excel(writer, index=False, sheet_name="Summary")
+    details_df.to_excel(writer, index=False, sheet_name="Details")
+print(f"\nSaved Excel: {excel_path}")
+
+summary_df.to_csv("cov_icl_summary.csv", index=False)
+details_df.to_csv("cov_icl_details.csv", index=False)
+
+print("\n=== Summary (precision / MSE / Hits@5 / 0-1(cov)=avg hits by |r̂|) ===")
+print(summary_df.sort_values(["c", "magnitude"]).to_string(index=False))
+print("\nDetails columns:", list(details_df.columns))
