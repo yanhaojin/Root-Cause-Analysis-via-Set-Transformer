@@ -1,0 +1,509 @@
+# ===========================
+# FULL COLAB SCRIPT
+# Mixed perturbations (mean/cov) • BCE-only training • Support-only eval
+# ===========================
+
+import math, sys, subprocess, torch, numpy as np, pandas as pd
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+
+# ----------------------------
+# Utils
+# ----------------------------
+def _seeded_generator(seed: Optional[int]):
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    return g
+
+# ----------------------------
+# Token encoder (per-variable)
+# ----------------------------
+class TokenEncoderMixed(nn.Module):
+    """
+    One token per variable i with features:
+      - mu_obs[i], mu_int[i], dmu[i]  (3)
+      - log var: log diag(Sigma_obs)[i], log diag(Sigma_int)[i]  (2)
+      - compressed covariance rows: Sigma_obs[i,:]P_obs, Sigma_int[i,:]P_int, and their diff  (3*r_sigma)
+    Project to d_model with an MLP.
+    """
+    def __init__(self, p: int, r_sigma: int, d_model: int, mlp_hidden: int, seed: int = 1234):
+        super().__init__()
+        self.p = p
+        self.r_sigma = r_sigma
+        g = _seeded_generator(seed)
+        # Frozen Gaussian projections (registered as buffers -> move with .to(device))
+        P_obs = torch.randn(p, r_sigma, generator=g) / math.sqrt(p)
+        P_int = torch.randn(p, r_sigma, generator=g) / math.sqrt(p)
+        self.register_buffer("P_obs", P_obs)
+        self.register_buffer("P_int", P_int)
+
+        base_dim = 3 + 2 + 3 * r_sigma
+        self.proj = nn.Sequential(
+            nn.Linear(base_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, d_model)
+        )
+
+    def forward(self, mu_obs: torch.Tensor, mu_int: torch.Tensor,
+                Sigma_obs: torch.Tensor, Sigma_int: torch.Tensor) -> torch.Tensor:
+        p = mu_obs.shape[0]
+        dmu  = mu_int - mu_obs
+        sig2o = torch.clip(torch.diag(Sigma_obs), min=1e-8)
+        sig2i = torch.clip(torch.diag(Sigma_int), min=1e-8)
+        lobs  = torch.log(sig2o)
+        lint  = torch.log(sig2i)
+
+        R_obs  = Sigma_obs @ self.P_obs     # (p, r_sigma)
+        R_int  = Sigma_int @ self.P_int     # (p, r_sigma)
+        R_diff = R_int - R_obs
+
+        feat = torch.cat([
+            mu_obs.view(p,1), mu_int.view(p,1), dmu.view(p,1),
+            lobs.view(p,1), lint.view(p,1),
+            R_obs, R_int, R_diff
+        ], dim=1)                           # (p, base_dim)
+        X = self.proj(feat)                 # (p, d_model)
+        return X.unsqueeze(0)               # (1, p, d_model)
+
+# ----------------------------
+# Set Transformer blocks
+# ----------------------------
+class FeedForward(nn.Module):
+    def __init__(self, d: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, d_ff), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_ff, d)
+        )
+        self.ln = nn.LayerNorm(d)
+    def forward(self, x): return self.ln(x + self.net(x))
+
+class MAB(nn.Module):
+    """Multihead Attention Block (Lee et al., 2019) implemented via torch MultiheadAttention (batch_first=True)."""
+    def __init__(self, d: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
+        self.ln1 = nn.LayerNorm(d)
+        self.ff  = FeedForward(d, d_ff, dropout)
+    def forward(self, Q: torch.Tensor, K: torch.Tensor):
+        attn, _ = self.mha(Q, K, K, need_weights=False)
+        H = self.ln1(Q + attn)
+        return self.ff(H)
+
+class SAB(nn.Module):
+    def __init__(self, d: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.mab = MAB(d, n_heads, d_ff, dropout)
+    def forward(self, X): return self.mab(X, X)
+
+class ISAB(nn.Module):
+    def __init__(self, d: int, n_heads: int, m: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.I = nn.Parameter(torch.randn(1, m, d) / math.sqrt(d))
+        self.mab1 = MAB(d, n_heads, d_ff, dropout)   # H = MAB(I, X)
+        self.mab2 = MAB(d, n_heads, d_ff, dropout)   # Y = MAB(X, H)
+    def forward(self, X):
+        I = self.I.expand(X.size(0), -1, -1)
+        H = self.mab1(I, X)
+        Y = self.mab2(X, H)
+        return Y
+
+class EquivariantBackbone(nn.Module):
+    def __init__(self, d: int, n_heads: int, d_ff: int, depth: int,
+                 dropout: float = 0.0, use_isab: bool = True, m_induce: int = 256):
+        super().__init__()
+        blocks = []
+        for _ in range(depth):
+            blocks.append(ISAB(d, n_heads, m_induce, d_ff, dropout) if use_isab else SAB(d, n_heads, d_ff, dropout))
+        self.blocks = nn.ModuleList(blocks)
+    def forward(self, X):
+        for blk in self.blocks:
+            X = blk(X)
+        return X
+
+# ----------------------------
+# SEM simulator
+# ----------------------------
+def sample_random_dag_and_params(p: int, exp_degree: float = 3.0, c: float = 1.0,
+                                 seed: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns (B, D) where B is strictly upper-triangular (acyclic) and D = c I.
+    Rescales B to spectral radius < 1 to ensure (I - B) invertible.
+    """
+    g = _seeded_generator(seed)
+    prob = min(1.0, exp_degree / max(1, p - 1))
+    # Avoid torch.full(..., generator=...) — use thresholded uniform:
+    A = (torch.rand((p, p), generator=g) < prob).to(torch.float32)
+    A = torch.triu(A, diagonal=1)  # acyclic orientation
+
+    W = (torch.rand((p, p), generator=g) * 0.6 + 0.2)          # in [0.2, 0.8]
+    S = torch.sign(torch.randn((p, p), generator=g))
+    B = (A * W * S).to(torch.float32)
+
+    with torch.no_grad():
+        eig = torch.linalg.eigvals(B).abs().max().item()
+        if eig >= 0.95:
+            B /= (eig / 0.9 + 1e-12)
+
+    D = torch.eye(p, dtype=torch.float32) * float(c)
+    return B, D
+
+def _draw_exogenous(n: int, mu: torch.Tensor, D: torch.Tensor, g: Optional[torch.Generator]):
+    p = mu.numel()
+    eye = torch.eye(p, dtype=D.dtype, device=D.device)
+    L = torch.linalg.cholesky(D + 1e-7 * eye)
+    z = torch.randn(n, p, generator=g, dtype=D.dtype, device=D.device) @ L.T
+    return z + mu.view(1, p)
+
+def simulate_samples_mean(B: torch.Tensor, D: torch.Tensor, n: int,
+                          delta: Optional[torch.Tensor], seed: Optional[int] = None):
+    """Mean perturbation: exogenous mean shifts by delta (else 0)."""
+    p = B.shape[0]
+    g = _seeded_generator(seed)
+    I = torch.eye(p, dtype=B.dtype, device=B.device)
+    IminusB_inv = torch.linalg.inv(I - B)
+    mu = torch.zeros(p, dtype=D.dtype, device=D.device) if delta is None else delta.to(D.dtype).to(D.device)
+    eta = _draw_exogenous(n, mu, D, g)
+    X = eta @ IminusB_inv.T
+    return X
+
+def simulate_samples_cov(B: torch.Tensor, D: torch.Tensor, n: int,
+                         v: Optional[torch.Tensor], seed: Optional[int] = None):
+    """Covariance perturbation: exogenous diag variance increases by v>=0 on support."""
+    p = B.shape[0]
+    g = _seeded_generator(seed)
+    I = torch.eye(p, dtype=B.dtype, device=B.device)
+    IminusB_inv = torch.linalg.inv(I - B)
+    Dp = D if v is None else (D + torch.diag(v.to(D.dtype).to(D.device)))
+    mu0 = torch.zeros(p, dtype=D.dtype, device=D.device)
+    eta = _draw_exogenous(n, mu0, Dp, g)
+    X = eta @ IminusB_inv.T
+    return X
+
+def empirical_stats(X_obs: torch.Tensor, X_int: torch.Tensor, eps_reg: float = 1e-3):
+    """Return (mu_obs, mu_int, Sigma_obs, Sigma_int)."""
+    mu_obs = X_obs.mean(0)
+    mu_int = X_int.mean(0)
+    Xm = X_obs - mu_obs
+    Xi = X_int - mu_int
+    p = X_obs.shape[1]
+    eye = torch.eye(p, dtype=X_obs.dtype, device=X_obs.device)
+    Sigma_obs = (Xm.T @ Xm) / max(1, X_obs.shape[0] - 1) + eps_reg * eye
+    Sigma_int = (Xi.T @ Xi) / max(1, X_int.shape[0] - 1) + eps_reg * eye
+    return mu_obs, mu_int, Sigma_obs, Sigma_int
+
+# ----------------------------
+# ICL Set Transformer (BCE-only head)
+# ----------------------------
+class ICLSetTransformerMixed(nn.Module):
+    def __init__(self, p: int, d_model: int = 128, n_heads: int = 8, d_ff: int = 256, depth: int = 3,
+                 r_sigma: int = 32, mlp_hidden: int = 128, dropout: float = 0.0,
+                 use_isab: bool = True, m_induce: int = 256, max_R: int = 160):
+        super().__init__()
+        self.p = p
+        self.encoder = TokenEncoderMixed(p, r_sigma, d_model, mlp_hidden)
+        self.backbone = EquivariantBackbone(d_model, n_heads, d_ff, depth, dropout, use_isab, m_induce)
+        self.cross = MAB(d_model, n_heads, d_ff, dropout)    # Query ← Supports
+        self.role_embed = nn.Embedding(2, d_model)           # 0=support, 1=query
+        self.prompt_embed = nn.Embedding(max_R, d_model)     # support id
+        self.cls_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # y (support)
+
+    def encode_sem(self, mu_obs, mu_int, Sigma_obs, Sigma_int, role_id: int, prompt_id: Optional[int] = None):
+        X = self.encoder(mu_obs, mu_int, Sigma_obs, Sigma_int)  # (1, p, d)
+        X = X + self.role_embed.weight[role_id].view(1,1,-1).expand(1, self.p, -1)
+        if prompt_id is not None:
+            X = X + self.prompt_embed.weight[prompt_id % self.prompt_embed.num_embeddings].view(1,1,-1).expand(1, self.p, -1)
+        return X
+
+    def forward_episode(self, supports: List[Dict], query: Dict):
+        # Encode supports
+        S_list = []
+        for r, s in enumerate(supports):
+            Xs = self.encode_sem(s["mu_obs"], s["mu_int"], s["Sigma_obs"], s["Sigma_int"], role_id=0, prompt_id=r)
+            S_list.append(Xs)
+        S = torch.cat(S_list, dim=1) if len(S_list) > 0 else None
+
+        # Encode query
+        Q = self.encode_sem(query["mu_obs"], query["mu_int"], query["Sigma_obs"], query["Sigma_int"], role_id=1)
+
+        # Backbone
+        if S is not None:
+            S = self.backbone(S)
+        Q = self.backbone(Q)
+
+        # Cross-attend (Query ← Supports)
+        if S is not None:
+            Q = self.cross(Q, S)
+
+        # Support classifier head
+        logits = self.cls_head(Q).squeeze(0).squeeze(-1)      # (p,)
+        p_q = torch.sigmoid(logits)
+        return p_q
+
+# ----------------------------
+# Episode generator (mixed prompts)
+# ----------------------------
+def make_icl_episode_mixed(R: int, p: int, n_obs: int, n_int: int, s: int,
+                           c: float, mag_mu: float, mag_sig: float,
+                           prob_mean: float = 0.5,
+                           force_query_type: Optional[str] = None,
+                           seed: Optional[int] = None):
+    """
+    One episode (R supports + 1 query) with shared (B, D=cI).
+    Each prompt is 'mean' or 'cov' with P(mean)=prob_mean, except the query if force_query_type is set.
+    For mean: delta has ±mag_mu on a size-s support. For cov: v has mag_sig on a size-s support.
+    Returns supports, query dicts including y and type (+ stats for encoder).
+    """
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+
+    B, D = sample_random_dag_and_params(p, exp_degree=3.0, c=c, seed=None if seed is None else seed + 7)
+
+    def _one_prompt(local_seed: Optional[int], prompt_type: Optional[str] = None):
+        gl = torch.Generator()
+        if local_seed is not None:
+            gl.manual_seed(local_seed)
+
+        tflag = prompt_type if prompt_type is not None else ("mean" if torch.rand(1, generator=gl).item() < prob_mean else "cov")
+        idx = torch.randperm(p, generator=gl)[:s]
+        y = torch.zeros(p); y[idx] = 1.0
+        delta = torch.zeros(p); v = torch.zeros(p)
+
+        if tflag == "mean":
+            signs = (torch.randint(0, 2, (s,), generator=gl).float() * 2 - 1)
+            delta[idx] = signs * mag_mu
+            X_obs = simulate_samples_mean(B, D, n_obs, delta=None, seed=local_seed)
+            X_int = simulate_samples_mean(B, D, n_int, delta=delta, seed=None if local_seed is None else local_seed + 1)
+        else:
+            v[idx] = mag_sig
+            X_obs = simulate_samples_cov(B, D, n_obs, v=None, seed=local_seed)
+            X_int = simulate_samples_cov(B, D, n_int, v=v,   seed=None if local_seed is None else local_seed + 1)
+
+        mu_obs, mu_int, Sigma_obs, Sigma_int = empirical_stats(X_obs, X_int, eps_reg=1e-3)
+
+        return {
+            "type": tflag,
+            "mu_obs": mu_obs, "mu_int": mu_int,
+            "Sigma_obs": Sigma_obs, "Sigma_int": Sigma_int,
+            "y": y, "delta": delta, "v": v, "B": B, "D": D
+        }
+
+    supports = [_one_prompt(local_seed=None if seed is None else seed + 100 * r) for r in range(R)]
+    query = _one_prompt(local_seed=None if seed is None else seed + 9999, prompt_type=force_query_type)
+    return supports, query
+
+# ----------------------------
+# Train (BCE-only)
+# ----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+# Problem setup
+p = 64
+R = 100
+s = 3
+n_obs = 512
+n_int = 512
+
+c_choices       = [0.2, 0.4, 0.6, 0.8, 1.0]
+mag_mu_choices  = [0.2, 0.4, 0.6, 0.8, 1.0]
+mag_sig_choices = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+model = ICLSetTransformerMixed(
+    p=p, d_model=128, n_heads=8, d_ff=256, depth=3,
+    r_sigma=32, mlp_hidden=128, dropout=0.0,
+    use_isab=True, m_induce=256, max_R=160
+).to(device)
+
+opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200)
+
+steps = 1500  # adjust for your budget
+for t in range(steps):
+    c = float(np.random.choice(c_choices))
+    mag_mu = float(np.random.choice(mag_mu_choices))
+    mag_sig = float(np.random.choice(mag_sig_choices))
+
+    opt.zero_grad()
+    supports, query = make_icl_episode_mixed(
+        R=R, p=p, n_obs=n_obs, n_int=n_int, s=s,
+        c=c, mag_mu=mag_mu, mag_sig=mag_sig, prob_mean=0.5, seed=t
+    )
+
+    # move to device
+    for spt in supports:
+        for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+            spt[k] = spt[k].to(device)
+    for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+        query[k] = query[k].to(device)
+
+    p_q = model.forward_episode(supports, query)
+
+    loss = F.binary_cross_entropy(p_q.clamp(1e-6, 1-1e-6), query["y"])
+    loss.backward()
+    opt.step(); sched.step()
+
+    if (t + 1) % 10 == 0:
+        print(f"step {t+1:04d} | loss={loss.item():.4f}")
+
+# ----------------------------
+# Paired evaluation (support-only)
+# ----------------------------
+@torch.no_grad()
+def eval_grid_mixed(model, R, p, n_obs, n_int, s,
+                    c_values, mag_mu_values, mag_sig_values,
+                    trials=20, prob_mean_supports=0.5,
+                    print_progress=True, trial_updates=4):
+    """
+    For each grid cell (c, mag_mu, mag_sig):
+      - build ONE SEM and ONE mixed support set
+      - evaluate TWO queries (mean & cov) on the same supports
+    Metrics (support-only, using p̂):
+      - support_precision_mean = hits_in_top_s/s for mean query
+      - support_precision_cov  = hits_in_top_s/s for cov query
+      - support_precision_avg  = average of the two
+    """
+    device = next(model.parameters()).device
+    summary_rows, details_rows = [], []
+
+    def build_supports_and_two_queries(c: float, mag_mu: float, mag_sig: float, seed: int):
+        B, D = sample_random_dag_and_params(p, exp_degree=3.0, c=c, seed=seed + 7)
+
+        def gen_prompt(prompt_type: str, local_seed: int, mag: float):
+            g = torch.Generator().manual_seed(local_seed)
+            idx = torch.randperm(p, generator=g)[:s]
+            y = torch.zeros(p); y[idx] = 1.0
+            delta = torch.zeros(p); v = torch.zeros(p)
+            if prompt_type == "mean":
+                signs = (torch.randint(0, 2, (s,), generator=g).float() * 2 - 1)
+                delta[idx] = signs * mag
+                X_obs = simulate_samples_mean(B, D, n_obs, delta=None, seed=local_seed)
+                X_int = simulate_samples_mean(B, D, n_int, delta=delta,   seed=local_seed + 1)
+            else:
+                v[idx] = mag
+                X_obs = simulate_samples_cov(B, D, n_obs, v=None, seed=local_seed)
+                X_int = simulate_samples_cov(B, D, n_int, v=v,   seed=local_seed + 1)
+            mu_obs, mu_int, Sigma_obs, Sigma_int = empirical_stats(X_obs, X_int, eps_reg=1e-3)
+            return {"type": prompt_type, "mu_obs": mu_obs, "mu_int": mu_int,
+                    "Sigma_obs": Sigma_obs, "Sigma_int": Sigma_int,
+                    "y": y, "delta": delta, "v": v, "B": B, "D": D}
+
+        supports = []
+        for r_id in range(R):
+            pr_type = "mean" if (torch.rand(1).item() < prob_mean_supports) else "cov"
+            mag = mag_mu if pr_type == "mean" else mag_sig
+            supports.append(gen_prompt(pr_type, seed + 100*r_id, mag))
+        q_mean = gen_prompt("mean", seed + 9999, mag_mu)
+        q_cov  = gen_prompt("cov",  seed + 9998, mag_sig)
+        return supports, q_mean, q_cov
+
+    total_cells = len(c_values) * len(mag_mu_values) * len(mag_sig_values)
+    cell_idx = 0
+    if print_progress:
+        print(f"Evaluating {total_cells} grid cells "
+              f"({len(c_values)}×{len(mag_mu_values)}×{len(mag_sig_values)}), trials={trials}")
+    trial_step = max(1, trials // max(1, trial_updates))
+
+    for c in c_values:
+        for mag_mu in mag_mu_values:
+            for mag_sig in mag_sig_values:
+                cell_idx += 1
+                if print_progress:
+                    print(f"[grid {cell_idx}/{total_cells}] c={c:.2f} | mag_mu={mag_mu:.2f} | mag_sig={mag_sig:.2f}")
+
+                supp_prec_mu_sum = 0.0
+                supp_prec_sig_sum = 0.0
+
+                for i in range(trials):
+                    if print_progress and ((i + 1) % trial_step == 0 or i == 0 or i + 1 == trials):
+                        print(f"   trials: {i+1}/{trials}", end="\r")
+
+                    supports, q_mean, q_cov = build_supports_and_two_queries(
+                        c=c, mag_mu=mag_mu, mag_sig=mag_sig, seed=12345 + i
+                    )
+
+                    # to device
+                    for spt in supports:
+                        for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+                            spt[k] = spt[k].to(device)
+                    for q in [q_mean, q_cov]:
+                        for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+                            q[k] = q[k].to(device)
+
+                    k_s = min(s, p)
+
+                    def eval_support_only(qdict, qtype: str):
+                        p_q = model.forward_episode(supports, qdict)
+                        true_idx = torch.nonzero(qdict["y"], as_tuple=False).view(-1)
+                        true_set = set(true_idx.tolist())
+                        pred_top_s = torch.topk(p_q, k=k_s).indices.tolist()
+                        hits_s = len(set(pred_top_s) & true_set)
+                        # details
+                        details_rows.append({
+                            "type": qtype,
+                            "c": float(c), "mag_mu": float(mag_mu), "mag_sig": float(mag_sig),
+                            "trial": int(i),
+                            "true_support": sorted(list(true_set)),
+                            "pred_top_s_by_p": sorted(pred_top_s),
+                            "hits_s_by_p": int(hits_s),
+                            "support_precision": float(hits_s / k_s)
+                        })
+                        return hits_s / k_s
+
+                    supp_prec_mu_sum += eval_support_only(q_mean, "mean")
+                    supp_prec_sig_sum += eval_support_only(q_cov,  "cov")
+
+                if print_progress:
+                    print(" " * 32, end="\r")
+                    print(f"   ✓ finished grid {cell_idx}/{total_cells}")
+
+                support_precision_mean = supp_prec_mu_sum / float(trials)
+                support_precision_cov  = supp_prec_sig_sum / float(trials)
+                support_precision_avg  = 0.5 * (support_precision_mean + support_precision_cov)
+
+                summary_rows.append({
+                    "c": float(c),
+                    "mag_mu": float(mag_mu),
+                    "mag_sig": float(mag_sig),
+                    "support_precision_mean": float(support_precision_mean),
+                    "support_precision_cov":  float(support_precision_cov),
+                    "support_precision_avg":  float(support_precision_avg),
+                })
+
+    return pd.DataFrame(summary_rows), pd.DataFrame(details_rows)
+
+# ---- Run evaluation
+c_values       = [0.2, 0.4, 0.6, 0.8, 1.0]
+mag_mu_values  = [0.2, 0.4, 0.6, 0.8, 1.0]
+mag_sig_values = [0.2, 0.4, 0.6, 0.8, 1.0]
+
+summary_df, details_df = eval_grid_mixed(
+    model, R=R, p=p, n_obs=n_obs, n_int=n_int, s=s,
+    c_values=c_values, mag_mu_values=mag_mu_values, mag_sig_values=mag_sig_values,
+    trials=20, prob_mean_supports=0.5, print_progress=True, trial_updates=4
+)
+
+# ---- Save Summary + Details to Excel and CSVs
+try:
+    import openpyxl  # noqa
+except Exception:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
+    import openpyxl  # noqa
+
+excel_path = "mixed_icl_support_only.xlsx"
+with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+    summary_df.sort_values(["c","mag_mu","mag_sig"]).to_excel(writer, index=False, sheet_name="Summary")
+    details_df.to_excel(writer, index=False, sheet_name="Details")
+print(f"\nSaved Excel: {excel_path}")
+
+summary_df.to_csv("mixed_icl_support_summary.csv", index=False)
+details_df.to_csv("mixed_icl_support_details.csv", index=False)
+
+print("\n=== Summary (support precision; c / mag_mu / mag_sig) ===")
+print(summary_df.sort_values(["c","mag_mu","mag_sig"]).to_string(index=False))
+
+print("\nDetails columns:", list(details_df.columns))
