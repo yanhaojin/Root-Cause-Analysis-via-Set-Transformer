@@ -1,0 +1,615 @@
+# ============================================================
+#  Sock Shop Dataset 2 -> Set Transformer RCA (RANKING)
+#   - Downloads sock-shop-2.zip from Zenodo (paper artifact)
+#   - Builds per-case pre/post shift features (CPU/MEM/DISK/DELAY/LOSS/OTHER)
+#   - TIME-AWARE split: train = earlier injection-time cases, test = later cases
+#   - Trains Set Transformer RCA ranker (scores per service)
+#   - Saves CSVs:
+#       1) sockshop2_case_predictions.csv  (prediction for EACH case in test)
+#       2) sockshop2_summary.csv           (overall + per-fault metrics)
+#       3) sockshop2_train_log.csv         (training curve)
+# ============================================================
+
+import os, re, sys, math, zipfile, random, subprocess
+from pathlib import Path
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                       "requests", "tqdm", "numpy", "pandas", "scikit-learn", "torch"])
+
+import difflib
+import requests
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm.auto import tqdm
+from torch.utils.data import Dataset, DataLoader
+
+# -----------------------
+# USER SETTINGS
+# -----------------------
+ZENODO_RECORD = "13305663"                 # contains sock-shop-2.zip
+ZIP_NAME = "sock-shop-2.zip"
+ZIP_URL = f"https://zenodo.org/records/{ZENODO_RECORD}/files/{ZIP_NAME}?download=1"
+
+SEED = 42
+TRAIN_FRAC = 0.60                          # temporal split: earliest 60% -> train, latest 40% -> test
+BATCH_SIZE = 16
+EPOCHS = 60
+LR = 3e-4
+WEIGHT_DECAY = 1e-4
+GRAD_CLIP = 1.0
+
+# fixed window around injection time (auto-clips if case is shorter)
+TOTAL_POINTS = 600
+PRE_POINTS = TOTAL_POINTS // 2
+POST_POINTS = TOTAL_POINTS - PRE_POINTS
+
+# Set Transformer
+D_ID = 16
+D_HIDDEN = 128
+HEADS = 4
+INDUCING = 16
+NUM_ISAB = 2
+
+# Output files
+CASE_CSV = "sockshop2_case_predictions.csv"
+SUMMARY_CSV = "sockshop2_summary.csv"
+LOG_CSV = "sockshop2_train_log.csv"
+# -----------------------
+
+# -----------------------
+# Reproducibility
+# -----------------------
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# ============================================================
+# 1) Download + unzip
+# ============================================================
+BASE_DIR = Path("./sockshop2_run")
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+ZIP_PATH = BASE_DIR / ZIP_NAME
+EXTRACT_DIR = BASE_DIR / "sock-shop-2_extracted"
+
+def download(url: str, dst: Path, chunk_size=2**20):
+    if dst.exists() and dst.stat().st_size > 0:
+        print(f"Already downloaded: {dst.name} ({dst.stat().st_size/1e6:.1f} MB)")
+        return
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        pbar = tqdm(total=total, unit="B", unit_scale=True, desc=f"Downloading {dst.name}")
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+        pbar.close()
+    print("Downloaded:", dst.name)
+
+print("Downloading:", ZIP_URL)
+download(ZIP_URL, ZIP_PATH)
+
+if not EXTRACT_DIR.exists():
+    EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(ZIP_PATH, "r") as z:
+        z.extractall(EXTRACT_DIR)
+    print("Extracted to:", EXTRACT_DIR)
+else:
+    print("Already extracted:", EXTRACT_DIR)
+
+# ============================================================
+# 2) Case discovery (inject_time.txt + csv)
+# ============================================================
+def pick_timeseries_csv(rep_dir: Path) -> Path | None:
+    p = rep_dir / "simple_data.csv"
+    if p.exists():
+        return p
+    csvs = [c for c in rep_dir.glob("*.csv") if c.name.lower() not in ("labels.csv",)]
+    if not csvs:
+        return None
+    csvs.sort(key=lambda x: x.stat().st_size, reverse=True)
+    return csvs[0]
+
+def parse_inject_time(path: Path):
+    s = path.read_text().strip()
+    # numeric time (seconds etc.)
+    try:
+        return float(s)
+    except:
+        # datetime string
+        dt = pd.to_datetime(s, errors="raise")
+        return float(dt.value) / 1e9  # seconds for sorting
+
+case_items = []
+for inj in EXTRACT_DIR.rglob("inject_time.txt"):
+    rep_dir = inj.parent
+    sf_dir = rep_dir.parent
+    csvp = pick_timeseries_csv(rep_dir)
+    if csvp is None:
+        continue
+
+    sf_name = sf_dir.name
+    if "_" in sf_name:
+        root_svc_raw = sf_name.split("_", 1)[0]
+        fault = sf_name.split("_", 1)[1]
+    else:
+        root_svc_raw, fault = sf_name, "UNKNOWN"
+
+    inj_val = parse_inject_time(inj)
+
+    case_items.append({
+        "case_id": f"{sf_dir.name}/{rep_dir.name}",
+        "root_service_raw": root_svc_raw,
+        "fault_type": str(fault).upper(),   # CPU/MEM/DISK/DELAY/LOSS
+        "csv_path": str(csvp),
+        "inject_path": str(inj),
+        "inject_time_value": float(inj_val),
+    })
+
+if len(case_items) == 0:
+    raise RuntimeError("No cases found. Try: !find sockshop2_run -maxdepth 5 -type f | head")
+
+print("Found cases:", len(case_items))
+print("Example:", case_items[0])
+
+# ============================================================
+# 3) Build service universe from column prefixes
+# ============================================================
+def detect_time_col(cols):
+    for c in cols:
+        if c.lower() == "time":
+            return c
+    for c in cols:
+        if "timestamp" in c.lower() or c.lower() in ("ts",):
+            return c
+    return cols[0]
+
+def service_from_col(col, time_col):
+    if col == time_col: return None
+    if "_" not in col:  return None
+    return col.split("_", 1)[0]
+
+all_services = set()
+for it in tqdm(case_items, desc="Scanning headers for services"):
+    df_head = pd.read_csv(it["csv_path"], nrows=1)
+    time_col = detect_time_col(df_head.columns.tolist())
+    for c in df_head.columns:
+        s = service_from_col(c, time_col)
+        if s:
+            all_services.add(s)
+
+all_services = sorted(all_services)
+S = len(all_services)
+service_to_idx = {s:i for i,s in enumerate(all_services)}
+fault_types = sorted({x["fault_type"] for x in case_items})
+print("Total services detected:", S)
+print("Fault types detected:", fault_types)
+print("Services:", all_services)
+
+# ============================================================
+# 4) STRICT root-service mapping (avoid label collapse)
+# ============================================================
+def norm_name(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[\s\-_]+", "", s)
+    s = s.replace("service", "").replace("svc", "")
+    return s
+
+norm_service_map = {}
+for s in all_services:
+    norm_service_map.setdefault(norm_name(s), []).append(s)
+
+def map_root_service(root_raw: str) -> str:
+    nr = norm_name(root_raw)
+    if nr in norm_service_map:
+        return norm_service_map[nr][0]
+    # containment
+    candidates = [s for s in all_services if (nr in norm_name(s) or norm_name(s) in nr)]
+    if candidates:
+        return difflib.get_close_matches(root_raw, candidates, n=1, cutoff=0.0)[0]
+    # fuzzy over all
+    best = difflib.get_close_matches(root_raw, all_services, n=1, cutoff=0.0)
+    if best:
+        return best[0]
+    raise KeyError(f"Cannot map root service '{root_raw}' to any service in columns")
+
+for it in case_items:
+    it["root_service"] = map_root_service(it["root_service_raw"])
+
+y_check = np.array([service_to_idx[it["root_service"]] for it in case_items], dtype=np.int64)
+print("Unique root labels:", len(np.unique(y_check)), "out of", S)
+if len(np.unique(y_check)) <= 1:
+    raise RuntimeError("Label collapse detected: all roots mapped to the same service (check mapping).")
+
+# ============================================================
+# 5) Feature extraction: pre/post distribution shift features per service
+#    Groups: CPU/MEM/DISK/DELAY/LOSS/OTHER
+# ============================================================
+GROUPS = ["CPU","MEM","DISK","DELAY","LOSS","OTHER"]
+D_PER_GROUP = 9
+D = len(GROUPS) * D_PER_GROUP
+
+def metric_group(metric_suffix: str) -> str:
+    m = metric_suffix.lower()
+    if "cpu" in m: return "CPU"
+    if "mem" in m or "memory" in m: return "MEM"
+    if "disk" in m or "fs" in m or "io" in m: return "DISK"
+    if "lat" in m or "delay" in m or "duration" in m or "response" in m: return "DELAY"
+    if "loss" in m or "drop" in m or "retrans" in m: return "LOSS"
+    return "OTHER"
+
+def safe_iqr(x):
+    x = x[np.isfinite(x)]
+    if x.size == 0: return 0.0
+    q75 = np.percentile(x, 75)
+    q25 = np.percentile(x, 25)
+    return float(q75 - q25)
+
+def build_case_features_grouped(csv_path: str, inject_path: str, services: list[str]) -> np.ndarray:
+    df = pd.read_csv(csv_path)
+    time_col = detect_time_col(df.columns.tolist())
+    df = df.sort_values(time_col).reset_index(drop=True)
+
+    t = df[time_col].to_numpy()
+    inj_txt = Path(inject_path).read_text().strip()
+    try:
+        inj = float(inj_txt)
+    except:
+        inj = float(pd.to_datetime(inj_txt).value) / 1e9
+
+    # robust index for numeric/datetime t
+    if np.issubdtype(t.dtype, np.number):
+        idx_inj = int(np.searchsorted(t.astype(float), float(inj), side="left"))
+    else:
+        tt = pd.to_datetime(t).view("int64") / 1e9
+        idx_inj = int(np.searchsorted(tt.astype(float), float(inj), side="left"))
+
+    idx_inj = max(1, min(idx_inj, len(df)-1))
+
+    # fixed window, auto-clip
+    pre_s = max(0, idx_inj - PRE_POINTS)
+    pre_e = idx_inj
+    post_s = idx_inj
+    post_e = min(len(df), idx_inj + POST_POINTS)
+
+    pre = df.iloc[pre_s:pre_e]
+    post = df.iloc[post_s:post_e]
+
+    metric_cols = [c for c in df.columns if c != time_col]
+    svc_group_cols = {s: {g: [] for g in GROUPS} for s in services}
+
+    for c in metric_cols:
+        if "_" not in c:
+            continue
+        s, met = c.split("_", 1)
+        if s not in svc_group_cols:
+            continue
+        g = metric_group(met)
+        svc_group_cols[s][g].append(c)
+
+    X = np.zeros((len(services), D), dtype=np.float32)
+
+    for si, s in enumerate(services):
+        feat = []
+        for g in GROUPS:
+            cols = svc_group_cols[s][g]
+            if len(cols) == 0 or len(pre) == 0 or len(post) == 0:
+                feat.extend([0.0]*(D_PER_GROUP-1) + [0.0])
+                continue
+
+            A = np.nan_to_num(pre[cols].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+            B = np.nan_to_num(post[cols].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+
+            mlen = min(len(A), len(B))
+            dlt = (B[:mlen] - A[:mlen]) if mlen > 0 else np.array([], dtype=np.float32)
+
+            mean_pre = float(np.mean(A)) if A.size else 0.0
+            mean_post = float(np.mean(B)) if B.size else 0.0
+            mean_delta = float(np.mean(dlt)) if dlt.size else 0.0
+
+            std_pre = float(np.std(A)) if A.size else 0.0
+            std_post = float(np.std(B)) if B.size else 0.0
+            std_delta = float(np.std(dlt)) if dlt.size else 0.0
+
+            med_delta = float(np.median(dlt)) if dlt.size else 0.0
+            iqr_delta = safe_iqr(dlt) if dlt.size else 0.0
+
+            feat.extend([mean_pre, mean_post, mean_delta,
+                         std_pre, std_post, std_delta,
+                         med_delta, iqr_delta,
+                         float(np.log1p(len(cols)))])
+        X[si] = np.array(feat, dtype=np.float32)
+
+    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+# Build tensors
+X_all, y_root, faults, case_ids, case_time = [], [], [], [], []
+for it in tqdm(case_items, desc="Building features"):
+    X_all.append(build_case_features_grouped(it["csv_path"], it["inject_path"], all_services))
+    y_root.append(service_to_idx[it["root_service"]])
+    faults.append(it["fault_type"])
+    case_ids.append(it["case_id"])
+    case_time.append(float(it["inject_time_value"]))
+
+X_all = np.stack(X_all, axis=0)  # [N,S,D]
+y_root = np.array(y_root, dtype=np.int64)
+faults = np.array(faults)
+case_ids = np.array(case_ids)
+case_time = np.array(case_time, dtype=float)
+
+N = len(y_root)
+print("Tensor:", X_all.shape, "| N:", N)
+
+# ============================================================
+# 6) TIME-AWARE split: earliest TRAIN_FRAC -> train, latest -> test
+# ============================================================
+order = np.argsort(case_time)
+n_train = int(round(TRAIN_FRAC * N))
+train_idx = order[:n_train]
+test_idx = order[n_train:]
+
+max_train_t = float(case_time[train_idx].max())
+min_test_t = float(case_time[test_idx].min())
+print(f"Temporal split: max(train_time)={max_train_t:.6f}, min(test_time)={min_test_t:.6f}")
+
+overlap = len(set(case_ids[train_idx]).intersection(set(case_ids[test_idx])))
+print("Train/Test case_id overlap:", overlap)
+if overlap != 0:
+    raise RuntimeError("Leakage detected: overlapping case_ids between train and test.")
+
+X_tr_raw, y_tr, ft_tr, cid_tr, t_tr = X_all[train_idx], y_root[train_idx], faults[train_idx], case_ids[train_idx], case_time[train_idx]
+X_te_raw, y_te, ft_te, cid_te, t_te = X_all[test_idx],  y_root[test_idx],  faults[test_idx],  case_ids[test_idx],  case_time[test_idx]
+
+# Normalize with TRAIN only
+mu = X_tr_raw.reshape(-1, D).mean(axis=0, keepdims=True)
+sd = X_tr_raw.reshape(-1, D).std(axis=0, keepdims=True) + 1e-6
+X_tr = np.nan_to_num((X_tr_raw - mu) / sd, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+X_te = np.nan_to_num((X_te_raw - mu) / sd, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+# ============================================================
+# 7) Dataset / Loader
+# ============================================================
+class RCADataset(Dataset):
+    def __init__(self, X, y, faults, case_ids, inj_times, n_services, train_mode=True):
+        self.X = X
+        self.y = y
+        self.faults = faults
+        self.case_ids = case_ids
+        self.inj_times = inj_times
+        self.n_services = n_services
+        self.train_mode = train_mode
+
+    def __len__(self): return len(self.y)
+
+    def __getitem__(self, i):
+        x = self.X[i]  # [S,D]
+        svc_ids = np.arange(self.n_services, dtype=np.int64)
+        if self.train_mode:
+            perm = np.random.permutation(self.n_services)
+            x = x[perm]
+            svc_ids = svc_ids[perm]
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(svc_ids, dtype=torch.long),
+            torch.tensor(int(self.y[i]), dtype=torch.long),
+            str(self.faults[i]),
+            str(self.case_ids[i]),
+            float(self.inj_times[i]),
+        )
+
+train_loader = DataLoader(RCADataset(X_tr, y_tr, ft_tr, cid_tr, t_tr, S, True),
+                          batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+test_loader  = DataLoader(RCADataset(X_te, y_te, ft_te, cid_te, t_te, S, False),
+                          batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+
+# ============================================================
+# 8) Set Transformer RCA ranker (score per service)
+# ============================================================
+class MAB(nn.Module):
+    def __init__(self, dim_q, dim_kv, dim_hidden, num_heads, dropout=0.0):
+        super().__init__()
+        self.fc_q = nn.Linear(dim_q, dim_hidden)
+        self.fc_k = nn.Linear(dim_kv, dim_hidden)
+        self.fc_v = nn.Linear(dim_kv, dim_hidden)
+        self.attn = nn.MultiheadAttention(dim_hidden, num_heads, dropout=dropout, batch_first=True)
+        self.ln1 = nn.LayerNorm(dim_hidden)
+        self.ff = nn.Sequential(nn.Linear(dim_hidden, 2*dim_hidden), nn.ReLU(), nn.Linear(2*dim_hidden, dim_hidden))
+        self.ln2 = nn.LayerNorm(dim_hidden)
+
+    def forward(self, Q, K, V):
+        q = self.fc_q(Q); k = self.fc_k(K); v = self.fc_v(V)
+        h, _ = self.attn(q, k, v, need_weights=False)
+        x = self.ln1(q + h)
+        x = self.ln2(x + self.ff(x))
+        return x
+
+class ISAB(nn.Module):
+    def __init__(self, dim_in, dim_hidden, num_heads, num_inducing):
+        super().__init__()
+        self.I = nn.Parameter(torch.randn(1, num_inducing, dim_hidden) * 0.02)
+        self.mab1 = MAB(dim_hidden, dim_in, dim_hidden, num_heads)
+        self.mab2 = MAB(dim_in, dim_hidden, dim_hidden, num_heads)
+
+    def forward(self, X):
+        B = X.size(0)
+        I = self.I.repeat(B, 1, 1)
+        H = self.mab1(I, X, X)
+        return self.mab2(X, H, H)
+
+class SetTransformerRCA(nn.Module):
+    def __init__(self, n_services, d_in, d_id, d_hidden, heads, inducing, num_isab):
+        super().__init__()
+        self.service_emb = nn.Embedding(n_services, d_id)
+        self.in_proj = nn.Linear(d_in + d_id, d_hidden)
+        self.isabs = nn.ModuleList([ISAB(d_hidden, d_hidden, heads, inducing) for _ in range(num_isab)])
+        self.score_head = nn.Sequential(nn.Linear(d_hidden, d_hidden), nn.ReLU(), nn.Linear(d_hidden, 1))
+
+    def forward(self, x, svc_ids):
+        x_id = self.service_emb(svc_ids)
+        h = self.in_proj(torch.cat([x, x_id], dim=-1))
+        for blk in self.isabs:
+            h = blk(h)
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+
+        scores_perm = self.score_head(h).squeeze(-1)  # [B,S] permuted order
+
+        # scatter back to canonical indices 0..S-1
+        B, S_ = scores_perm.shape
+        scores_full = torch.full((B, S_), -1e9, device=scores_perm.device, dtype=scores_perm.dtype)
+        scores_full.scatter_(1, svc_ids, scores_perm)
+        scores_full = torch.nan_to_num(scores_full, nan=-1e9, posinf=1e9, neginf=-1e9)
+        return scores_full
+
+model = SetTransformerRCA(S, D, D_ID, D_HIDDEN, HEADS, INDUCING, NUM_ISAB).to(device)
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+criterion = nn.CrossEntropyLoss()
+
+# ============================================================
+# 9) Metrics + eval helpers
+# ============================================================
+def ranks_from_scores(scores: np.ndarray, y_true: np.ndarray):
+    order = np.argsort(-scores, axis=1)
+    ranks = np.empty(len(y_true), dtype=np.int64)
+    for i in range(len(y_true)):
+        ranks[i] = int(np.where(order[i] == y_true[i])[0][0]) + 1
+    return ranks, order
+
+def ac_at_k(ranks, k): return float(np.mean(ranks <= k))
+def avg_at_5(ranks):   return float(np.mean([ac_at_k(ranks, k) for k in range(1, 6)]))
+def mrr(ranks):        return float(np.mean(1.0 / ranks))
+
+@torch.no_grad()
+def predict_all(loader):
+    model.eval()
+    all_scores, all_y, all_ft, all_cid, all_t = [], [], [], [], []
+    for x, svc_ids, y, ft, cid, inj_t in loader:
+        scores = model(x.to(device), svc_ids.to(device)).cpu().numpy()
+        all_scores.append(scores)
+        all_y.append(y.numpy())
+        all_ft.extend(list(ft))
+        all_cid.extend(list(cid))
+        all_t.extend([float(v) for v in inj_t])
+    return (np.concatenate(all_scores, axis=0),
+            np.concatenate(all_y, axis=0),
+            np.array(all_ft),
+            np.array(all_cid),
+            np.array(all_t, dtype=float))
+
+def stable_softmax_np(scores):
+    scores = np.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
+    s = scores - scores.max(axis=1, keepdims=True)
+    ex = np.exp(np.clip(s, -50, 50))
+    denom = np.maximum(ex.sum(axis=1, keepdims=True), 1e-12)
+    return ex / denom
+
+# ============================================================
+# 10) Train
+# ============================================================
+train_log = []
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    losses = []
+    for x, svc_ids, y, _ft, _cid, _t in train_loader:
+        x = x.to(device); svc_ids = svc_ids.to(device); y = y.to(device)
+        opt.zero_grad(set_to_none=True)
+        scores = model(x, svc_ids)
+        loss = criterion(scores, y)
+        if not torch.isfinite(loss):
+            print("[WARN] Non-finite loss. Try LR=1e-4.")
+            break
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        opt.step()
+        losses.append(loss.item())
+
+    row = {"epoch": epoch, "train_loss": float(np.mean(losses)) if losses else float("nan")}
+    if epoch == 1 or epoch % 10 == 0 or epoch == EPOCHS:
+        te_scores, te_y2, _, _, _ = predict_all(test_loader)
+        te_ranks, _ = ranks_from_scores(te_scores, te_y2)
+        row.update({
+            "test_AC@1": ac_at_k(te_ranks, 1),
+            "test_AC@3": ac_at_k(te_ranks, 3),
+            "test_AC@5": ac_at_k(te_ranks, 5),
+            "test_Avg@5": avg_at_5(te_ranks),
+            "test_MRR": mrr(te_ranks),
+            "test_MeanRank": float(np.mean(te_ranks)),
+        })
+        print(f"Epoch {epoch:03d} | loss={row['train_loss']:.4f} | "
+              f"AC@1={row['test_AC@1']:.4f} Avg@5={row['test_Avg@5']:.4f} MRR={row['test_MRR']:.4f}")
+    train_log.append(row)
+
+pd.DataFrame(train_log).to_csv(LOG_CSV, index=False)
+print("Saved:", LOG_CSV)
+
+# ============================================================
+# 11) Final evaluation + save per-case predictions + summary
+# ============================================================
+te_scores, te_y2, te_ft2, te_cid2, te_time2 = predict_all(test_loader)
+te_ranks, te_order = ranks_from_scores(te_scores, te_y2)
+te_probs = stable_softmax_np(te_scores)
+
+# Per-case predictions (TEST)
+rows = []
+for i in range(len(te_y2)):
+    yt = int(te_y2[i])
+    order5 = te_order[i, :5].tolist()
+    pred = int(order5[0])
+    rows.append({
+        "case_id": str(te_cid2[i]),
+        "fault_type": str(te_ft2[i]),
+        "inject_time_value": float(te_time2[i]),
+        "true_root": all_services[yt],
+        "pred_root": all_services[pred],
+        "true_rank": int(te_ranks[i]),
+        "p_true": float(te_probs[i, yt]),
+        "p_pred": float(te_probs[i, pred]),
+        "top1": all_services[order5[0]] if len(order5)>0 else "",
+        "top2": all_services[order5[1]] if len(order5)>1 else "",
+        "top3": all_services[order5[2]] if len(order5)>2 else "",
+        "top4": all_services[order5[3]] if len(order5)>3 else "",
+        "top5": all_services[order5[4]] if len(order5)>4 else "",
+    })
+
+df_cases = pd.DataFrame(rows).sort_values("inject_time_value").reset_index(drop=True)
+df_cases.to_csv(CASE_CSV, index=False)
+print("Saved:", CASE_CSV)
+display(df_cases.head(10))
+
+# Summary metrics (overall + by fault)
+summary_rows = []
+summary_rows.append({"scope":"ALL", "metric":"AC@1", "value": ac_at_k(te_ranks,1)})
+summary_rows.append({"scope":"ALL", "metric":"AC@3", "value": ac_at_k(te_ranks,3)})
+summary_rows.append({"scope":"ALL", "metric":"AC@5", "value": ac_at_k(te_ranks,5)})
+summary_rows.append({"scope":"ALL", "metric":"Avg@5", "value": avg_at_5(te_ranks)})
+summary_rows.append({"scope":"ALL", "metric":"MRR", "value": mrr(te_ranks)})
+summary_rows.append({"scope":"ALL", "metric":"MeanRank", "value": float(np.mean(te_ranks))})
+summary_rows.append({"scope":"ALL", "metric":"N_test", "value": float(len(te_ranks))})
+summary_rows.append({"scope":"SPLIT", "metric":"train_cases", "value": float(len(train_idx))})
+summary_rows.append({"scope":"SPLIT", "metric":"test_cases", "value": float(len(test_idx))})
+summary_rows.append({"scope":"SPLIT", "metric":"max_train_time", "value": float(case_time[train_idx].max())})
+summary_rows.append({"scope":"SPLIT", "metric":"min_test_time", "value": float(case_time[test_idx].min())})
+
+for ft in sorted(set(te_ft2.tolist())):
+    mask = (te_ft2 == ft)
+    r = te_ranks[mask]
+    if r.size == 0:
+        continue
+    summary_rows.append({"scope": ft, "metric":"AC@1", "value": ac_at_k(r,1)})
+    summary_rows.append({"scope": ft, "metric":"AC@3", "value": ac_at_k(r,3)})
+    summary_rows.append({"scope": ft, "metric":"AC@5", "value": ac_at_k(r,5)})
+    summary_rows.append({"scope": ft, "metric":"Avg@5", "value": avg_at_5(r)})
+    summary_rows.append({"scope": ft, "metric":"MRR", "value": mrr(r)})
+    summary_rows.append({"scope": ft, "metric":"MeanRank", "value": float(np.mean(r))})
+    summary_rows.append({"scope": ft, "metric":"N_test", "value": float(r.size)})
+
+df_summary = pd.DataFrame(summary_rows)
+df_summary.to_csv(SUMMARY_CSV, index=False)
+print("Saved:", SUMMARY_CSV)
+display(df_summary.head(30)) 
