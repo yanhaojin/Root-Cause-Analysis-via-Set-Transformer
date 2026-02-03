@@ -1,0 +1,789 @@
+# ============================================================
+# Compare RC-score (paper's proposed method) vs SetTransformer
+# on the SAME patient-wise setup, and generate Figure-7-style plots.
+#
+# Paper details used:
+# - Treat other patients as observational samples for each patient. :contentReference[oaicite:4]{index=4}
+# - Apply Algorithm 3 with v=20 permutations; use z^2>1.5 as responses. :contentReference[oaicite:5]{index=5}
+# - Figure 7 metric: count #patients with true root cause in top-k. :contentReference[oaicite:6]{index=6}
+# ============================================================
+
+# -----------------------------
+# Cell 0: installs (Colab-safe)
+# -----------------------------
+!pip -q install python-calamine tqdm
+
+import os, re, tarfile, random, math
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+
+# Optional: Lasso (used to approximate Markov blanket inside RC-score Algorithm-3 style)
+try:
+    from sklearn.linear_model import LassoCV
+    HAVE_SKLEARN = True
+except Exception:
+    HAVE_SKLEARN = False
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("DEVICE =", DEVICE, "| sklearn:", HAVE_SKLEARN)
+
+if DEVICE == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+# -----------------------------
+# Global experiment knobs
+# -----------------------------
+K_CAND = 512            # candidate set size per patient (shared by BOTH methods)
+TRAIN_SPLIT = 0.7
+BATCH_SIZE = 32
+EPOCHS_ST = 500
+
+# RC-score (Algorithm-3-ish on candidate set)
+V_PERM = 20             # paper uses v=20 in gene expression application :contentReference[oaicite:7]{index=7}
+Z2_RESPONSE_THR = 1.5   # paper uses z^2 > 1.5 as responses :contentReference[oaicite:8]{index=8}
+MAX_RESPONSES = 30      # cap for speed (take top z^2 responses)
+MB_MAX_PRED = 80        # max predictors for Markov blanket regression
+MB_CORR_TOP = 120       # preselect predictors by abs corr
+RC_THRESH_LIST = [0.1, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0]  # Algorithm-1 style thresholds
+RC_MAX_PERM_TOTAL = 120 # cap permutations per response subsystem (speed)
+COV_SHRINK = 0.10       # simple diagonal shrinkage for stability
+
+# Synthetic augmentation for SetTransformer (optional; does NOT affect RC-score)
+USE_SYN = True
+N_SYN = 600
+P_SYN = 256
+MAX_PARENTS = 3
+DELTA_SCALE = 3.0
+RIDGE_LAMBDA = 1e-2
+
+OUT_DIR = Path("/content/compare_rcscore_settransformer")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# -----------------------------
+# Cell 1: Download + extract Zenodo + supplementary Excel
+# -----------------------------
+DATA_DIR = Path("/content/data_gene_expr")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def download(url: str, out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return
+    import urllib.request
+    print("Downloading:", out_path.name)
+    urllib.request.urlretrieve(url, out_path)
+
+def untar(tar_path: Path, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    marker = out_dir / ".extracted_ok"
+    if marker.exists():
+        return
+    print("Extracting:", tar_path.name)
+    with tarfile.open(tar_path, "r:gz") as tf:
+        tf.extractall(out_dir)
+    marker.write_text("ok")
+
+URL_NS  = "https://zenodo.org/records/4646823/files/fib_ns--hg19--gencode34.tar.gz?download=1"
+URL_SS1 = "https://zenodo.org/records/7510836/files/fib_ss_high_seq--hg19--gencode34.tar.gz?download=1"
+
+tar_ns  = DATA_DIR / "fib_ns--hg19--gencode34.tar.gz"
+tar_ss1 = DATA_DIR / "fib_ss_high_seq--hg19--gencode34.tar.gz"
+
+download(URL_NS, tar_ns)
+download(URL_SS1, tar_ss1)
+
+dir_ns  = DATA_DIR / "ns"
+dir_ss1 = DATA_DIR / "ss_high"
+untar(tar_ns, dir_ns)
+untar(tar_ss1, dir_ss1)
+
+LABELS_XLSX_URL = "https://static-content.springer.com/esm/art%3A10.1186%2Fs13073-022-01019-9/MediaObjects/13073_2022_1019_MOESM1_ESM.xlsx"
+labels_xlsx = DATA_DIR / "Yepez_2022_AdditionalFile1.xlsx"
+download(LABELS_XLSX_URL, labels_xlsx)
+
+# -----------------------------
+# Cell 2: Load + preprocess gene expression
+# -----------------------------
+def canon_ensg(x):
+    if x is None:
+        return None
+    s = str(x).strip().upper()
+    m = re.search(r"(ENSG\d+)", s)
+    return m.group(1) if m else None
+
+GENECOUNTS_NS  = dir_ns  / "fib_ns--hg19--gencode34" / "geneCounts.tsv.gz"
+GENECOUNTS_SS1 = dir_ss1 / "fib_ss_high_seq--hg19--gencode34" / "geneCounts.tsv.gz"
+assert GENECOUNTS_NS.exists()
+assert GENECOUNTS_SS1.exists()
+
+def load_gene_counts(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, sep="\t", compression="infer")
+    gene_col = df.columns[0]
+    ensg = df[gene_col].map(canon_ensg)
+    df = df.drop(columns=[gene_col])
+    df.index = ensg
+    df = df[~df.index.isna()]
+    df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    df = df.groupby(df.index).sum()
+    return df
+
+counts_ns  = load_gene_counts(GENECOUNTS_NS)
+counts_ss1 = load_gene_counts(GENECOUNTS_SS1)
+
+common_genes = sorted(list(set(counts_ns.index) & set(counts_ss1.index)))
+counts_all = pd.concat([counts_ns.loc[common_genes], counts_ss1.loc[common_genes]], axis=1)
+counts_all = counts_all.loc[:, ~counts_all.columns.duplicated()]
+print("Raw counts (genes x samples):", counts_all.shape)
+
+# paper preprocessing: counts<10 in >90%, log + size factor :contentReference[oaicite:9]{index=9}
+low_frac = (counts_all < 10).mean(axis=1)
+counts_f = counts_all.loc[low_frac <= 0.90]
+print("After low-count filter:", counts_f.shape)
+
+lib_size = counts_f.sum(axis=0).astype(np.float64)
+size_factor = lib_size / np.median(lib_size)
+expr = np.log1p(counts_f.div(size_factor, axis=1)).astype(np.float32)
+
+# cheap proxy for corr>0.999 removal
+def drop_duplicate_profiles(expr_df: pd.DataFrame, decimals=3):
+    Xr = np.round(expr_df.values.astype(np.float32), decimals=decimals)
+    V = np.ascontiguousarray(Xr).view(np.dtype((np.void, Xr.dtype.itemsize * Xr.shape[1])))
+    _, idx = np.unique(V, return_index=True)
+    idx = np.sort(idx)
+    return expr_df.iloc[idx]
+
+expr2 = drop_duplicate_profiles(expr, decimals=3)
+print("After duplicate-profile pruning:", expr2.shape)
+
+X_samples_genes = expr2.T
+gene_ids_full = np.array(expr2.index, dtype=object)      # ENSG...
+sample_ids_full = np.array(expr2.columns, dtype=object)  # Rxxxxx
+X = X_samples_genes.values.astype(np.float32)
+
+n_samples, p_genes = X.shape
+print("Final X:", (n_samples, p_genes))
+
+gene_to_col = {str(g): j for j, g in enumerate(gene_ids_full)}
+sample_to_row = {str(s): i for i, s in enumerate(sample_ids_full)}
+sample_set = set(map(str, sample_ids_full))
+gene_set = set(map(str, gene_ids_full))
+
+mu_full = X.mean(axis=0).astype(np.float32)
+sd_full = (X.std(axis=0) + 1e-6).astype(np.float32)
+
+# -----------------------------
+# Cell 3: Labels from supplementary Excel (S2/S4) + local symbol->ENSG from S5
+# -----------------------------
+xl = pd.ExcelFile(labels_xlsx, engine="calamine")
+
+def clean_sheet_header(df: pd.DataFrame):
+    if df is None or df.shape[0] == 0:
+        return df
+    row0 = df.iloc[0].astype(str).fillna("")
+    key = " ".join(row0.values).lower()
+    if ("patient" in key and "id" in key) or ("genetic" in key and "diagn" in key) or ("gene_name" in key and "gene" in key):
+        df2 = df.copy()
+        df2.columns = df2.iloc[0]
+        df2 = df2.iloc[1:].reset_index(drop=True)
+        return df2
+    return df
+
+df_s5 = clean_sheet_header(xl.parse("S5 Mean, dispersion & recall")).dropna(axis=0, how="all").dropna(axis=1, how="all")
+if "gene_name" not in df_s5.columns or "gene" not in df_s5.columns:
+    print("S5 columns:", list(df_s5.columns))
+    raise RuntimeError("S5 missing gene_name/gene columns")
+
+symbol_to_ens = {}
+for sym, gid in zip(df_s5["gene_name"].astype(str).values, df_s5["gene"].astype(str).values):
+    symU = sym.strip().upper()
+    e = canon_ensg(gid)
+    if symU and e:
+        symbol_to_ens[symU] = e
+
+def extract_gene_symbol_from_diag(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    m = re.search(r"(ENSG\d+)", s, flags=re.I)
+    if m:
+        return canon_ensg(m.group(1))
+    toks = re.findall(r"\b[A-Za-z0-9\-]{2,20}\b", s)
+    for t in toks:
+        tU = t.upper()
+        if tU.startswith(("NM_", "NR_", "CHR", "ENST", "RS")):
+            continue
+        if re.search(r"[A-Z]", tU):
+            return tU
+    return None
+
+def load_labels(sheet_name: str):
+    df = clean_sheet_header(xl.parse(sheet_name)).dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if "Patient ID" not in df.columns or "Genetic diagnosis" not in df.columns:
+        print(f"[WARN] {sheet_name} columns:", list(df.columns))
+        return pd.DataFrame(columns=["Patient ID","GeneSym"])
+    out = df[["Patient ID","Genetic diagnosis"]].copy()
+    out = out.dropna(subset=["Patient ID"])
+    out["Patient ID"] = out["Patient ID"].astype(str).str.strip()
+    out["GeneSym"] = out["Genetic diagnosis"].map(extract_gene_symbol_from_diag)
+    out = out.dropna(subset=["GeneSym"])
+    return out[["Patient ID","GeneSym"]]
+
+lab_s2 = load_labels("S2 Solved via RNA-seq")
+lab_s4 = load_labels("S4 WES with defect")
+labels_df = pd.concat([lab_s2, lab_s4], ignore_index=True).drop_duplicates("Patient ID")
+
+def map_genesym_to_ens(gsym: str):
+    g = str(gsym).upper()
+    if g.startswith("ENSG"):
+        return canon_ensg(g)
+    return symbol_to_ens.get(g, None)
+
+labels_df["ENSG"] = labels_df["GeneSym"].map(map_genesym_to_ens)
+labels_df = labels_df.dropna(subset=["ENSG"])
+
+labels_df = labels_df[labels_df["Patient ID"].isin(sample_set)]
+labels_df = labels_df[labels_df["ENSG"].isin(gene_set)]
+
+print("Matched labeled patients:", len(labels_df))
+if len(labels_df) == 0:
+    raise RuntimeError("No labeled patients matched this expression subset.")
+
+# -----------------------------
+# Utilities: build per-patient candidate set (shared)
+# -----------------------------
+def loo_mu_sd(row_idx: int):
+    # leave-one-out mean/sd against all other patients
+    x = X[row_idx]
+    S1 = X.sum(axis=0, dtype=np.float64) - x.astype(np.float64)
+    S2 = (X.astype(np.float64)**2).sum(axis=0) - (x.astype(np.float64)**2)
+    mu = (S1 / (n_samples - 1)).astype(np.float32)
+    ex2 = (S2 / (n_samples - 1)).astype(np.float32)
+    var = np.maximum(ex2 - mu*mu, 1e-8)
+    sd = np.sqrt(var).astype(np.float32)
+    return mu, sd
+
+def build_candidate_instance(patient_id: str, true_ensg: str):
+    row_idx = sample_to_row[patient_id]
+    true_col = gene_to_col[true_ensg]
+    mu, sd = loo_mu_sd(row_idx)
+    z = (X[row_idx] - mu) / sd
+    sqz = z*z
+    topk = np.argpartition(-sqz, K_CAND-1)[:K_CAND]
+    if true_col not in topk:
+        topk[-1] = true_col
+    topk = topk[np.argsort(-sqz[topk])]
+    target_pos = int(np.where(topk == true_col)[0][0])
+    feats = np.stack([z[topk], X[row_idx, topk], mu[topk], sd[topk]], axis=1).astype(np.float32)
+    return row_idx, topk.astype(np.int64), feats, target_pos
+
+instances_real = []
+for pid, ens in tqdm(list(zip(labels_df["Patient ID"].values, labels_df["ENSG"].values)), desc="Build candidate instances"):
+    instances_real.append(build_candidate_instance(str(pid), str(ens)))
+
+# split patients
+idx = np.arange(len(instances_real))
+np.random.shuffle(idx)
+split = max(1, int(TRAIN_SPLIT * len(idx)))
+train_idx, test_idx = idx[:split], idx[split:]
+train_real = [instances_real[i] for i in train_idx]
+test_real  = [instances_real[i] for i in test_idx]
+print("Train real:", len(train_real), "Test real:", len(test_real))
+
+# -----------------------------
+# Synthetic augmentation for SetTransformer (optional)
+# -----------------------------
+def build_synthetic_instances():
+    var_full = X.var(axis=0)
+    G_syn = np.argsort(-var_full)[:P_SYN]
+    order = np.argsort(-var_full[G_syn])
+    G_syn_ord = G_syn[order]
+
+    X_syn = X[:, G_syn_ord].astype(np.float64)
+    X_syn = (X_syn - X_syn.mean(axis=0, keepdims=True)) / (X_syn.std(axis=0, keepdims=True) + 1e-8)
+    Corr = (X_syn.T @ X_syn) / (X_syn.shape[0]-1)
+    Corr = np.clip(Corr, -1.0, 1.0)
+
+    Xraw = X[:, G_syn_ord].astype(np.float64)
+    B = np.zeros((P_SYN, P_SYN), dtype=np.float32)
+    b0 = Xraw.mean(axis=0).astype(np.float32)
+    sigma_eps = np.zeros(P_SYN, dtype=np.float32)
+
+    for j in range(P_SYN):
+        y = Xraw[:, j]
+        if j == 0:
+            sigma_eps[j] = float(np.std(y - y.mean()) + 1e-6)
+            continue
+        prev = np.arange(j)
+        corr_prev = np.abs(Corr[j, prev])
+        pa = prev[np.argpartition(-corr_prev, min(MAX_PARENTS, j)-1)[:min(MAX_PARENTS, j)]]
+        Xp = Xraw[:, pa]
+        Xp = Xp - Xp.mean(axis=0, keepdims=True)
+        y0 = y - y.mean()
+        XtX = Xp.T @ Xp + RIDGE_LAMBDA * np.eye(Xp.shape[1])
+        beta = np.linalg.solve(XtX, Xp.T @ y0)
+        for k_idx, k in enumerate(pa):
+            B[j, k] = float(beta[k_idx])
+        resid = y0 - (Xp @ beta)
+        sigma_eps[j] = float(np.std(resid) + 1e-6)
+
+    def sim_intervention(root_j, delta):
+        x = np.zeros(P_SYN, dtype=np.float32)
+        eps = np.random.randn(P_SYN).astype(np.float32) * sigma_eps
+        for j in range(P_SYN):
+            val = b0[j] + eps[j]
+            if j > 0:
+                parents = np.nonzero(B[j, :j])[0]
+                if len(parents) > 0:
+                    val += float(np.dot(B[j, parents], x[parents]))
+            if j == root_j:
+                val += delta
+            x[j] = val
+        return x
+
+    syn = []
+    for _ in range(N_SYN):
+        root_pos = np.random.randint(0, P_SYN)
+        delta = float(np.random.choice([-1.0, 1.0]) * DELTA_SCALE)
+        x_syn = sim_intervention(root_pos, delta)
+
+        x_full = mu_full.copy()
+        x_full[G_syn_ord] = x_syn
+        z = (x_full - mu_full) / sd_full
+        sqz = z*z
+
+        topk = np.argpartition(-sqz, K_CAND-1)[:K_CAND]
+        true_col = int(G_syn_ord[root_pos])
+        if true_col not in topk:
+            topk[-1] = true_col
+        topk = topk[np.argsort(-sqz[topk])]
+        target_pos = int(np.where(topk == true_col)[0][0])
+
+        feats = np.stack([z[topk], x_full[topk], mu_full[topk], sd_full[topk]], axis=1).astype(np.float32)
+        syn.append((-1, topk.astype(np.int64), feats, target_pos))
+    return syn
+
+syn_instances = build_synthetic_instances() if USE_SYN else []
+print("Synthetic instances:", len(syn_instances))
+
+# -----------------------------
+# SetTransformer training + scoring
+# -----------------------------
+all_gene_cols = np.unique(np.concatenate([ins[1] for ins in (train_real + test_real + syn_instances)]))
+col_to_vocab = {int(c): i for i, c in enumerate(all_gene_cols)}
+vocab_size = len(all_gene_cols)
+
+class GeneSetDataset(Dataset):
+    def __init__(self, inst_list):
+        self.inst = inst_list
+    def __len__(self):
+        return len(self.inst)
+    def __getitem__(self, i):
+        row_idx, gene_cols, feats, target_pos = self.inst[i]
+        gene_vocab = np.array([col_to_vocab[int(c)] for c in gene_cols], dtype=np.int64)
+        return (
+            torch.from_numpy(gene_vocab),
+            torch.from_numpy(feats),
+            torch.tensor(target_pos, dtype=torch.long),
+            torch.tensor(row_idx, dtype=torch.long),
+        )
+
+train_ds = GeneSetDataset(train_real + syn_instances)
+test_ds  = GeneSetDataset(test_real)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+
+class MAB(nn.Module):
+    def __init__(self, dim_q, dim_k, dim_model, num_heads, dropout=0.0):
+        super().__init__()
+        self.fc_q = nn.Linear(dim_q, dim_model)
+        self.fc_k = nn.Linear(dim_k, dim_model)
+        self.fc_v = nn.Linear(dim_k, dim_model)
+        self.attn = nn.MultiheadAttention(dim_model, num_heads, batch_first=True, dropout=dropout)
+        self.ln0 = nn.LayerNorm(dim_model)
+        self.ff = nn.Sequential(
+            nn.Linear(dim_model, dim_model),
+            nn.ReLU(),
+            nn.Linear(dim_model, dim_model),
+            nn.Dropout(dropout),
+        )
+        self.ln1 = nn.LayerNorm(dim_model)
+    def forward(self, Q, K):
+        q = self.fc_q(Q); k = self.fc_k(K); v = self.fc_v(K)
+        a, _ = self.attn(q, k, v, need_weights=False)
+        h = self.ln0(q + a)
+        return self.ln1(h + self.ff(h))
+
+class ISAB(nn.Module):
+    def __init__(self, dim_in, dim_model, num_heads, num_inds, dropout=0.0):
+        super().__init__()
+        self.I = nn.Parameter(torch.randn(1, num_inds, dim_model))
+        self.mab0 = MAB(dim_model, dim_in, dim_model, num_heads, dropout=dropout)
+        self.mab1 = MAB(dim_in, dim_model, dim_model, num_heads, dropout=dropout)
+    def forward(self, X):
+        Bsz = X.size(0)
+        I = self.I.expand(Bsz, -1, -1)
+        H = self.mab0(I, X)
+        return self.mab1(X, H)
+
+class SetTransformerRanker(nn.Module):
+    def __init__(self, vocab_size, feat_dim, gene_emb_dim=32, dim_model=64, num_heads=2, num_inds=16, num_layers=4, dropout=0.1):
+        super().__init__()
+        self.gene_emb = nn.Embedding(vocab_size, gene_emb_dim)
+        self.in_proj = nn.Linear(gene_emb_dim + feat_dim, dim_model)
+        self.enc = nn.ModuleList([ISAB(dim_model, dim_model, num_heads, num_inds, dropout=dropout) for _ in range(num_layers)])
+        self.out = nn.Linear(dim_model, 1)
+    def forward(self, gene_vocab, feats):
+        g = self.gene_emb(gene_vocab)
+        x = torch.cat([g, feats], dim=-1)
+        x = self.in_proj(x)
+        for blk in self.enc:
+            x = blk(x)
+        return self.out(x).squeeze(-1)
+
+st_model = SetTransformerRanker(vocab_size=vocab_size, feat_dim=4).to(DEVICE)
+st_opt = torch.optim.AdamW(st_model.parameters(), lr=1e-3, weight_decay=1e-4)
+st_scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE=="cuda"))
+
+@torch.no_grad()
+def st_rank_on_test():
+    st_model.eval()
+    ranks = []
+    for gene_vocab, feats, y, _ in test_loader:
+        gene_vocab = gene_vocab.to(DEVICE, non_blocking=True)
+        feats = feats.to(DEVICE, non_blocking=True)
+        y = y.to(DEVICE, non_blocking=True)
+        logits = st_model(gene_vocab, feats).detach().cpu().numpy()
+        y_np = y.detach().cpu().numpy()
+        for b in range(y_np.shape[0]):
+            order = np.argsort(-logits[b])
+            ranks.append(int(np.where(order == int(y_np[b]))[0][0]) + 1)
+    return np.array(ranks, dtype=int)
+
+best_hit1 = -1.0
+best_state = None
+
+for epoch in range(1, EPOCHS_ST+1):
+    st_model.train()
+    total_loss = 0.0
+    for gene_vocab, feats, y, _ in train_loader:
+        gene_vocab = gene_vocab.to(DEVICE, non_blocking=True)
+        feats = feats.to(DEVICE, non_blocking=True)
+        y = y.to(DEVICE, non_blocking=True)
+        st_opt.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=(DEVICE=="cuda")):
+            logits = st_model(gene_vocab, feats)
+            loss = F.cross_entropy(logits, y)
+        st_scaler.scale(loss).backward()
+        st_scaler.unscale_(st_opt)
+        nn.utils.clip_grad_norm_(st_model.parameters(), 1.0)
+        st_scaler.step(st_opt)
+        st_scaler.update()
+        total_loss += loss.item() * y.size(0)
+
+    ranks = st_rank_on_test()
+    hit1 = float((ranks <= 1).mean()) if len(ranks) else 0.0
+    if hit1 > best_hit1:
+        best_hit1 = hit1
+        best_state = {k: v.detach().cpu() for k, v in st_model.state_dict().items()}
+    print(f"[SetTransformer] Epoch {epoch:02d} loss={total_loss/len(train_ds):.4f} test_hit@1={int((ranks<=1).sum())}/{len(ranks)} best={best_hit1:.3f}")
+
+if best_state is not None:
+    st_model.load_state_dict(best_state)
+
+ranks_st = st_rank_on_test()
+print("SetTransformer test patients:", len(ranks_st))
+
+# -----------------------------
+# RC-score (paper Algorithm-3 style, applied on SAME candidate sets)
+# We approximate Algorithm 3 by:
+#   - responses = genes in candidate set with z^2 > 1.5 (cap MAX_RESPONSES) :contentReference[oaicite:10]{index=10}
+#   - Markov blanket estimated by LassoCV (or corr fallback)
+#   - within subsystem, run Algorithm-2 steps (permutation + Cholesky) and compute score for response
+# -----------------------------
+def shrink_cov(S, lam=0.1):
+    D = np.diag(np.diag(S))
+    return (1-lam)*S + lam*D
+
+def rc_generate_permutations(z2, thresholds, v, max_total):
+    # Algorithm-1-ish: for each tau build D={j:z2>=tau}; for each dl in D, create v perms ([~D], dl, D\dl)
+    p = len(z2)
+    perms = []
+    all_idx = np.arange(p)
+    for tau in thresholds:
+        D = all_idx[z2 >= tau]
+        if len(D) == 0:
+            continue
+        notD = all_idx[z2 < tau]
+        D_list = D.tolist()
+        for dl in D_list:
+            rest = [x for x in D_list if x != dl]
+            for _ in range(v):
+                a = notD.copy()
+                b = np.array(rest, dtype=int).copy()
+                np.random.shuffle(a)
+                np.random.shuffle(b)
+                pi = np.concatenate([a, np.array([dl], dtype=int), b])
+                perms.append(pi)
+                if len(perms) >= max_total:
+                    return perms
+    # also add a few random perms for robustness
+    while len(perms) < min(max_total, 30):
+        pi = all_idx.copy()
+        np.random.shuffle(pi)
+        perms.append(pi)
+    return perms[:max_total]
+
+def rc_score_on_subsystem(Xobs_sub, xI_sub, resp_local_idx, v_perm=20):
+    """
+    Xobs_sub: (n_obs, m) observational
+    xI_sub: (m,) interventional
+    resp_local_idx: index of response variable in [0..m-1]
+    returns: score for the response variable (float)
+    """
+    n_obs, m = Xobs_sub.shape
+    mu = Xobs_sub.mean(axis=0)
+    sd = Xobs_sub.std(axis=0) + 1e-6
+    z = (xI_sub - mu) / sd
+    z2 = z*z
+
+    perms = rc_generate_permutations(z2, RC_THRESH_LIST, v_perm, RC_MAX_PERM_TOTAL)
+
+    # Precompute covariance once (then permute it)
+    S = np.cov(Xobs_sub, rowvar=False, bias=False)
+    S = shrink_cov(S, COV_SHRINK)
+    S = S + 1e-6*np.eye(m)
+
+    best_c = -1.0
+    for pi in perms:
+        mu_pi = mu[pi]
+        xI_pi = xI_sub[pi]
+        S_pi = S[np.ix_(pi, pi)]
+        # Cholesky
+        try:
+            L = np.linalg.cholesky(S_pi)
+        except np.linalg.LinAlgError:
+            # add jitter
+            L = np.linalg.cholesky(S_pi + 1e-3*np.eye(m))
+
+        # xi = L^{-1}(xI - mu)
+        xi = np.linalg.solve(L, (xI_pi - mu_pi))
+        ax = np.abs(xi)
+        if m == 1:
+            c_hat = 1e9
+            u_hat = 0
+        else:
+            # top-2 gap
+            idx_sort = np.argsort(-ax)
+            a1 = ax[idx_sort[0]]
+            a2 = ax[idx_sort[1]] + 1e-12
+            c_hat = float((a1 - a2) / a2)
+            u_hat = int(idx_sort[0])
+
+        # map u_hat back to original subsystem index
+        u_orig = int(pi[u_hat])
+
+        # keep if the predicted root cause is the response variable
+        if u_orig == resp_local_idx and c_hat > best_c:
+            best_c = c_hat
+
+    return float(best_c if best_c > 0 else 0.0)
+
+def estimate_markov_blanket(Xobs_cand, resp_j, max_pred=MB_MAX_PRED):
+    """
+    Xobs_cand: (n_obs, K) observational (candidate genes)
+    resp_j: int index of response gene in [0..K-1]
+    Return: list of predictor indices in candidate set.
+    """
+    n_obs, K = Xobs_cand.shape
+    # standardize
+    Z = (Xobs_cand - Xobs_cand.mean(axis=0)) / (Xobs_cand.std(axis=0) + 1e-6)
+    y = Z[:, resp_j]
+    # correlation preselect
+    corr = np.abs(Z.T @ y) / max(1, (n_obs - 1))
+    corr[resp_j] = -np.inf
+    pred_pool = np.argpartition(-corr, min(MB_CORR_TOP, K-1)-1)[:min(MB_CORR_TOP, K-1)]
+    pred_pool = pred_pool[corr[pred_pool] > 0]
+
+    if len(pred_pool) == 0:
+        return []
+
+    # LassoCV if available, otherwise fallback to top correlations
+    if HAVE_SKLEARN:
+        Xp = Z[:, pred_pool]
+        # small CV for speed
+        lasso = LassoCV(cv=5, n_alphas=40, max_iter=2000, random_state=SEED, n_jobs=None)
+        lasso.fit(Xp, y)
+        coef = lasso.coef_
+        chosen = pred_pool[np.where(np.abs(coef) > 1e-6)[0]]
+        # cap size
+        if len(chosen) > max_pred:
+            # keep strongest abs coef
+            cc = np.abs(coef[np.where(np.abs(coef) > 1e-6)[0]])
+            keep = np.argsort(-cc)[:max_pred]
+            chosen = chosen[keep]
+        return chosen.tolist()
+    else:
+        # fallback: just take top correlations
+        topm = pred_pool[np.argsort(-corr[pred_pool])[:max_pred]]
+        return topm.tolist()
+
+def rc_rank_for_patient(row_idx, gene_cols_full, feats, target_pos):
+    """
+    Compute RC-score ranks within the candidate set for ONE patient.
+    Inputs are the same instance tuple used by SetTransformer.
+    """
+    # candidate genes: full indices in original gene space
+    K = len(gene_cols_full)
+    assert K == K_CAND
+
+    # build observational samples (others)
+    # Xobs in full gene space:
+    mask = np.ones(n_samples, dtype=bool)
+    mask[row_idx] = False
+    Xobs = X[mask][:, gene_cols_full]          # (n-1, K)
+    xI = X[row_idx, gene_cols_full]            # (K,)
+
+    # z^2 for responses (within candidate set)
+    mu = Xobs.mean(axis=0)
+    sd = Xobs.std(axis=0) + 1e-6
+    z = (xI - mu) / sd
+    z2 = z*z
+
+    # response set: z^2 > 1.5 (paper) and top MAX_RESPONSES by z^2
+    resp = np.where(z2 > Z2_RESPONSE_THR)[0]
+    if len(resp) == 0:
+        resp = np.argsort(-z2)[:min(MAX_RESPONSES, K)]
+    else:
+        resp = resp[np.argsort(-z2[resp])][:min(MAX_RESPONSES, len(resp))]
+
+    # RC scores for candidate genes (only for those that get nonzero)
+    scores = np.zeros(K, dtype=np.float32)
+
+    # compute for each response gene i: estimate MB, run algo-2 steps on subsystem, assign score to i
+    for i in resp:
+        mb = estimate_markov_blanket(Xobs, i, max_pred=MB_MAX_PRED)
+        # subsystem = {i} U mb (ensure unique)
+        sub = [i] + [j for j in mb if j != i]
+        # cap subsystem size for speed
+        if len(sub) > 1 + MB_MAX_PRED:
+            sub = sub[:1+MB_MAX_PRED]
+        Xobs_sub = Xobs[:, sub]
+        xI_sub = xI[sub]
+        # response local index = 0 in this ordering
+        s = rc_score_on_subsystem(Xobs_sub, xI_sub, resp_local_idx=0, v_perm=V_PERM)
+        scores[i] = max(scores[i], s)
+
+    # If some genes never scored, leave them at 0 (they’ll rank low)
+    # Rank root cause among candidate set:
+    true_pos = int(target_pos)
+    order = np.argsort(-scores)
+    rank_true = int(np.where(order == true_pos)[0][0]) + 1
+    return rank_true, scores
+
+# Compute RC ranks on test patients
+ranks_rc = []
+rc_scores_list = []
+for inst in tqdm(test_real, desc="RC-score on test"):
+    row_idx, gene_cols, feats, target_pos = inst
+    rk, sc = rc_rank_for_patient(row_idx, gene_cols, feats, target_pos)
+    ranks_rc.append(rk)
+    rc_scores_list.append(sc)
+ranks_rc = np.array(ranks_rc, dtype=int)
+
+print("RC-score test patients:", len(ranks_rc))
+
+# -----------------------------
+# Figure-7-style plot for BOTH methods
+# -----------------------------
+def topk_counts(ranks, max_k=100):
+    ks = np.arange(1, max_k+1)
+    cnt = np.array([(ranks <= k).sum() for k in ks], dtype=int)
+    return ks, cnt
+
+max_k_left = min(100, K_CAND)
+ksL, cnt_rc_L = topk_counts(ranks_rc, max_k_left)
+_,   cnt_st_L = topk_counts(ranks_st, max_k_left)
+
+ksR, cnt_rc_R = topk_counts(ranks_rc, 20)
+_,   cnt_st_R = topk_counts(ranks_st, 20)
+
+plt.figure(figsize=(6,4))
+plt.plot(ksL, cnt_rc_L, label="RC-score (paper)")
+plt.plot(ksL, cnt_st_L, label="SetTransformer")
+plt.xlabel("k")
+plt.ylabel("#patients with true root in top-k")
+plt.title(f"Figure-7-style (k=1..{max_k_left})")
+plt.legend()
+plt.tight_layout()
+
+plt.figure(figsize=(6,4))
+plt.plot(ksR, cnt_rc_R, label="RC-score (paper)")
+plt.plot(ksR, cnt_st_R, label="SetTransformer")
+plt.xlabel("k")
+plt.ylabel("#patients with true root in top-k")
+plt.title("Zoom-in (k=1..20)")
+plt.legend()
+plt.tight_layout()
+
+# -----------------------------
+# Save CSV + plots
+# -----------------------------
+df_ranks = pd.DataFrame({
+    "patient_id": [str(sample_ids_full[inst[0]]) for inst in test_real],
+    "rank_rcscore_candidate": ranks_rc,
+    "rank_settransformer_candidate": ranks_st,
+})
+df_ranks.to_csv(OUT_DIR / "per_patient_ranks.csv", index=False)
+
+df_topk = pd.DataFrame({
+    "k": ksL,
+    "count_rcscore": cnt_rc_L,
+    "count_settransformer": cnt_st_L,
+})
+df_topk.to_csv(OUT_DIR / "topk_counts_table.csv", index=False)
+
+summary = pd.DataFrame([{
+    "n_total_labeled": int(len(instances_real)),
+    "n_test": int(len(test_real)),
+    "K_candidates": int(K_CAND),
+    "rc_hit@1": int((ranks_rc<=1).sum()),
+    "rc_hit@5": int((ranks_rc<=5).sum()),
+    "rc_hit@10": int((ranks_rc<=10).sum()),
+    "rc_hit@20": int((ranks_rc<=20).sum()),
+    "st_hit@1": int((ranks_st<=1).sum()),
+    "st_hit@5": int((ranks_st<=5).sum()),
+    "st_hit@10": int((ranks_st<=10).sum()),
+    "st_hit@20": int((ranks_st<=20).sum()),
+    "rc_v_perm": int(V_PERM),
+    "rc_response_thr_z2": float(Z2_RESPONSE_THR),
+    "use_synthetic": bool(USE_SYN),
+    "n_synthetic": int(len(syn_instances)),
+}])
+summary.to_csv(OUT_DIR / "summary.csv", index=False)
+
+plt.figure(1)
+plt.savefig(OUT_DIR / "figure7_left.png", dpi=200)
+plt.figure(2)
+plt.savefig(OUT_DIR / "figure7_zoom.png", dpi=200)
+
+print("Saved to:", OUT_DIR)
+print(summary) 
