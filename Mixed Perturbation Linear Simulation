@@ -1,0 +1,360 @@
+try:
+    import sympy, sys, subprocess
+    from packaging import version
+    if version.parse(sympy.__version__) >= version.parse("1.13"):
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "sympy==1.12"])
+        import importlib; import sympy as _sym; importlib.reload(_sym)
+        print("Pinned SymPy to:", _sym.__version__)
+except Exception as e:
+    print("SymPy pin note:", repr(e))
+
+import math, numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
+from typing import List, Dict, Optional, Tuple
+
+# ----------------------------
+# Small helpers
+# ----------------------------
+def _g(seed=None):
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    return g
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+# ----------------------------
+# Nonlinear SEM (Diamond model)
+# w ~ U(-3,3)
+# x = w^2 + n_x,  n_x ~ U(-1,1)
+# y = 4*sqrt(|w|) + n_y,  n_y ~ U(-1,1)
+# z = 2*sin(x) + 2*sin(y) + n_z,  n_z ~ U(-1,1)
+# Mean intervention: add +delta[i] to noise (or to w directly)
+# ----------------------------
+VAR_NAMES = ["w","x","y","z"]
+P = 4
+
+def sample_diamond(n: int, delta: Optional[torch.Tensor] = None, seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Returns X of shape (n,4) in order [w,x,y,z].
+    delta: length-4 vector; if None => zeros. (NO sign sampling here.)
+    """
+    g = _g(seed)
+    if delta is None:
+        delta = torch.zeros(P)
+    delta = delta.to(torch.float32)
+
+    # w root
+    w_noise = (torch.rand(n, generator=g) * 6.0 - 3.0).to(torch.float32)
+    w = w_noise + delta[0]
+
+    # x
+    nx = (torch.rand(n, generator=g) * 2.0 - 1.0).to(torch.float32)
+    x = (w ** 2) + (nx + delta[1])
+
+    # y
+    ny = (torch.rand(n, generator=g) * 2.0 - 1.0).to(torch.float32)
+    y = 4.0 * torch.sqrt(torch.clamp(w.abs(), min=1e-12)) + (ny + delta[2])
+
+    # z
+    nz = (torch.rand(n, generator=g) * 2.0 - 1.0).to(torch.float32)
+    z = 2.0 * torch.sin(x) + 2.0 * torch.sin(y) + (nz + delta[3])
+
+    return torch.stack([w, x, y, z], dim=1)
+
+def empirical_stats(X_obs: torch.Tensor, X_int: torch.Tensor, eps_reg: float = 1e-3):
+    mu_obs = X_obs.mean(dim=0)
+    mu_int = X_int.mean(dim=0)
+    Xm = X_obs - mu_obs
+    Xi = X_int - mu_int
+    p = X_obs.shape[1]
+    eye = torch.eye(p, dtype=X_obs.dtype, device=X_obs.device)
+    Sigma_obs = (Xm.T @ Xm) / max(1, X_obs.shape[0] - 1) + eps_reg * eye
+    Sigma_int = (Xi.T @ Xi) / max(1, X_int.shape[0] - 1) + eps_reg * eye
+    return mu_obs, mu_int, Sigma_obs, Sigma_int
+
+# ----------------------------
+# Token encoder with Σ-compress (obs only; NO L_hat)
+# Token_i = [mu_obs[i], mu_int[i], dmu[i], (Sigma_obs @ P)[i,:]]
+# ----------------------------
+class TokenEncoderMeanOnlyNoL(nn.Module):
+    def __init__(self, p: int, r_sigma: int, d_model: int, mlp_hidden: int, seed: int = 1234):
+        super().__init__()
+        self.p = p
+        g = _g(seed)
+        P_obs = torch.randn(p, r_sigma, generator=g) / math.sqrt(p)
+        self.register_buffer("P_obs", P_obs)  # only obs since no cov perturbation
+
+        base_dim = 3 + r_sigma  # [mu_o, mu_i, dmu] + compressed row
+        self.proj = nn.Sequential(
+            nn.Linear(base_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, d_model)
+        )
+
+    def forward(self, mu_obs, mu_int, Sigma_obs):
+        p = mu_obs.shape[0]
+        dmu  = mu_int - mu_obs
+        comp = Sigma_obs @ self.P_obs           # (p, r_sigma)
+
+        mu_pack = torch.stack([mu_obs, mu_int, dmu], dim=1)  # (p, 3)
+        feat = torch.cat([mu_pack, comp], dim=1)             # (p, 3 + r_sigma)
+        X = self.proj(feat)                                  # (p, d_model)
+        return X.unsqueeze(0)                                # (1, p, d_model)
+
+# ----------------------------
+# Set Transformer bits
+# ----------------------------
+class FeedForward(nn.Module):
+    def __init__(self, d, d_ff, dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, d_ff), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_ff, d)
+        )
+        self.ln = nn.LayerNorm(d)
+    def forward(self, x): return self.ln(x + self.net(x))
+
+class MAB(nn.Module):
+    def __init__(self, d, n_heads, d_ff, dropout=0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
+        self.ln1 = nn.LayerNorm(d)
+        self.ff = FeedForward(d, d_ff, dropout)
+    def forward(self, Q, K):
+        attn, _ = self.mha(Q, K, K, need_weights=False)
+        H = self.ln1(Q + attn)
+        return self.ff(H)
+
+class SAB(nn.Module):
+    def __init__(self, d, n_heads, d_ff, dropout=0.0):
+        super().__init__()
+        self.mab = MAB(d, n_heads, d_ff, dropout)
+    def forward(self, X): return self.mab(X, X)
+
+class ISAB(nn.Module):
+    def __init__(self, d, n_heads, m, d_ff, dropout=0.0):
+        super().__init__()
+        self.I = nn.Parameter(torch.randn(1, m, d) / math.sqrt(d))
+        self.mab1 = MAB(d, n_heads, d_ff, dropout)  # H = MAB(I, X)
+        self.mab2 = MAB(d, n_heads, d_ff, dropout)  # Y = MAB(X, H)
+    def forward(self, X):
+        I = self.I.expand(X.size(0), -1, -1)
+        H = self.mab1(I, X)
+        return self.mab2(X, H)
+
+class EquivariantBackbone(nn.Module):
+    def __init__(self, d, n_heads, d_ff, depth, dropout=0.0, use_isab=True, m_induce=64):
+        super().__init__()
+        blocks = []
+        for _ in range(depth):
+            blocks.append(ISAB(d, n_heads, m_induce, d_ff, dropout) if use_isab
+                          else SAB(d, n_heads, d_ff, dropout))
+        self.blocks = nn.ModuleList(blocks)
+    def forward(self, X):
+        for b in self.blocks: X = b(X)
+        return X
+
+# ----------------------------
+# Model (BCE head)
+# ----------------------------
+class ICLSetTransformerMeanOnlyNoL(nn.Module):
+    def __init__(self, p: int, d_model: int = 128, n_heads: int = 8, d_ff: int = 256, depth: int = 3,
+                 r_sigma: int = 16, mlp_hidden: int = 128, dropout: float = 0.0,
+                 use_isab: bool = True, m_induce: int = 64, max_R: int = 128):
+        super().__init__()
+        self.p = p
+        self.encoder = TokenEncoderMeanOnlyNoL(p, r_sigma, d_model, mlp_hidden)
+        self.backbone = EquivariantBackbone(d_model, n_heads, d_ff, depth, dropout, use_isab, m_induce)
+        self.cross = MAB(d_model, n_heads, d_ff, dropout)   # Query ← Supports
+        self.role_embed = nn.Embedding(2, d_model)          # 0=support, 1=query
+        self.prompt_embed = nn.Embedding(max_R, d_model)    # support id
+        self.cls_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
+
+    def encode_sem(self, mu_obs, mu_int, Sigma_obs, role_id: int, prompt_id: Optional[int] = None):
+        X = self.encoder(mu_obs, mu_int, Sigma_obs)  # (1,p,d)
+        X = X + self.role_embed.weight[role_id].view(1,1,-1).expand(1, self.p, -1)
+        if prompt_id is not None:
+            X = X + self.prompt_embed.weight[prompt_id % self.prompt_embed.num_embeddings].view(1,1,-1).expand(1, self.p, -1)
+        return X
+
+    def forward_episode(self, supports: List[Dict], query: Dict) -> torch.Tensor:
+        S_list = []
+        for r, s in enumerate(supports):
+            Xs = self.encode_sem(s["mu_obs"], s["mu_int"], s["Sigma_obs"], role_id=0, prompt_id=r)
+            S_list.append(Xs)
+        S = torch.cat(S_list, dim=1) if len(S_list) > 0 else None
+
+        Q = self.encode_sem(query["mu_obs"], query["mu_int"], query["Sigma_obs"], role_id=1)
+
+        if S is not None:
+            S = self.backbone(S)
+        Q = self.backbone(Q)
+        if S is not None:
+            Q = self.cross(Q, S)
+
+        logits = self.cls_head(Q).squeeze(0).squeeze(-1)   # (p,)
+        return torch.sigmoid(logits)
+
+# ----------------------------
+# Build a single prompt
+# ----------------------------
+def build_prompt_no_sign(s: int, n_obs: int, n_int: int, mag_mu: float, seed: int) -> Dict:
+    g = _g(seed)
+    idx = torch.randperm(P, generator=g)[:s]
+    y = torch.zeros(P); y[idx] = 1.0
+    delta = torch.zeros(P); delta[idx] = float(mag_mu)     # <-- always +mag (no ±)
+    X_obs = sample_diamond(n_obs, delta=None, seed=seed)
+    X_int = sample_diamond(n_int, delta=delta,  seed=seed+1)
+    mu_obs, mu_int, Sigma_obs, Sigma_int = empirical_stats(X_obs, X_int, eps_reg=1e-3)
+    return {"mu_obs": mu_obs, "mu_int": mu_int, "Sigma_obs": Sigma_obs, "Sigma_int": Sigma_int,
+            "y": y, "delta": delta}
+
+def make_episode(R: int, s: int, n_obs: int, n_int: int, mag_mu: float, seed: int):
+    supports = [build_prompt_no_sign(s, n_obs, n_int, mag_mu, seed + 100*r) for r in range(R)]
+    query    = build_prompt_no_sign(s, n_obs, n_int, mag_mu, seed + 9999)
+    return supports, query
+
+# ----------------------------
+# Training (BCE only)
+# ----------------------------
+def train_bce(model: nn.Module, steps: int, R: int, s: int, n_obs: int, n_int: int,
+              mag_choices=(0.2,0.4,0.6,0.8,1.0), lr=2e-4, wd=1e-4):
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps))
+
+    for t in range(steps):
+        mag = float(np.random.choice(mag_choices))
+        supports, query = make_episode(R, s, n_obs, n_int, mag, seed=t)
+
+        for spt in supports:
+            for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+                spt[k] = spt[k].to(device)
+        for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+            query[k] = query[k].to(device)
+
+        p_q = model.forward_episode(supports, query)
+        loss = F.binary_cross_entropy(p_q.clamp(1e-6, 1-1e-6), query["y"])
+
+        opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+        if (t+1) % 10 == 0:
+            print(f"step {t+1:04d} | BCE={loss.item():.4f}")
+    return model
+
+# ----------------------------
+# Evaluation (support recovery, s=2 by default)
+# ----------------------------
+@torch.no_grad()
+def eval_grid(model, R, s, n_obs, n_int, mag_values, trials=50, k_top=5, print_progress=True):
+    summary_rows, details_rows = [], []
+    p = P
+    device_ = next(model.parameters()).device
+
+    for m_i, mag in enumerate(mag_values):
+        if print_progress:
+            print(f"[{m_i+1}/{len(mag_values)}] magnitude={mag:.2f}")
+        TP = FP = 0
+        hits5 = 0
+        z01_sum = 0
+
+        for i in range(trials):
+            if print_progress and ((i+1) % max(1, trials//4) == 0 or i == 0 or i+1 == trials):
+                print(f"   trials: {i+1}/{trials}", end="\r")
+
+            supports, query = make_episode(R, s, n_obs, n_int, mag, seed=12345 + i)
+
+            for spt in supports:
+                for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+                    spt[k] = spt[k].to(device_)
+            for k in ["mu_obs","mu_int","Sigma_obs","Sigma_int","y"]:
+                query[k] = query[k].to(device_)
+
+            p_q = model.forward_episode(supports, query)
+            k_s = min(s, p)
+            true_idx = torch.nonzero(query["y"], as_tuple=False).view(-1)
+            true_set = set(true_idx.tolist())
+
+            # precision@S by p_hat
+            pred_idx_s_by_p = torch.topk(p_q, k=k_s).indices.tolist()
+            hits_s_by_p = len(set(pred_idx_s_by_p) & true_set)
+            TP += hits_s_by_p
+            FP += (k_s - hits_s_by_p)
+
+            # hits@5
+            k5 = min(k_top, p)
+            pred_idx_5 = torch.topk(p_q, k=k5).indices.tolist()
+            hits5 += len(set(pred_idx_5) & true_set)
+
+            # 0/1 (avg hits among top-s)
+            z01_sum += hits_s_by_p
+
+            details_rows.append({
+                "magnitude": float(mag),
+                "trial": int(i),
+                "true_support": sorted(list(true_set)),
+                "pred_top_s_by_p": sorted(pred_idx_s_by_p),
+                "hits_s_by_p": int(hits_s_by_p),
+                "topk_idx": pred_idx_5,
+                "topk_p": p_q.detach().cpu()[pred_idx_5].tolist(),
+            })
+
+        precision = TP / max(1, TP + FP)
+        summary_rows.append({
+            "magnitude": float(mag),
+            "precision_at_s": float(precision),
+            "hits_at_5": float(hits5 / float(trials)),
+            "zero_one": float(z01_sum / float(trials)),   # in [0, s], here s=2
+        })
+        if print_progress:
+            print(" " * 24, end="\r")
+            print(f"   ✓ done magnitude={mag:.2f}")
+
+    return pd.DataFrame(summary_rows), pd.DataFrame(details_rows)
+
+# ----------------------------
+# Run: train + eval + save
+# ----------------------------
+# Problem setup
+p = P          # 4 variables: w,x,y,z
+R = 64         # shots (supports) per episode
+s = 2          # *** as requested ***
+n_obs = 512
+n_int = 512
+
+model = ICLSetTransformerMeanOnlyNoL(
+    p=p, d_model=128, n_heads=8, d_ff=256, depth=3,
+    r_sigma=16, mlp_hidden=128, dropout=0.0,
+    use_isab=True, m_induce=64, max_R=128
+).to(device)
+
+print("\nTraining (BCE only, NO L_hat in token)…")
+model = train_bce(
+    model, steps=2000, R=R, s=s, n_obs=n_obs, n_int=n_int,
+    mag_choices=(0.2, 0.4, 0.6, 0.8, 1.0), lr=2e-4, wd=1e-4
+)
+
+print("\nEvaluating…")
+mag_values = [0.2, 0.4, 0.6, 0.8, 1.0]
+summary_df, details_df = eval_grid(
+    model, R=R, s=s, n_obs=n_obs, n_int=n_int,
+    mag_values=mag_values, trials=50, k_top=5, print_progress=True
+)
+
+# Save artifacts
+try:
+    import openpyxl  # noqa
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
+    import openpyxl  # noqa
+
+summary_df.to_csv("nl_mean_only_no_sign_noL_summary.csv", index=False)
+details_df.to_csv("nl_mean_only_no_sign_noL_details.csv", index=False)
+with pd.ExcelWriter("nl_mean_only_no_sign_noL_summary_and_details.xlsx", engine="openpyxl") as writer:
+    summary_df.to_excel(writer, index=False, sheet_name="Summary")
+    details_df.to_excel(writer, index=False, sheet_name="Details")
+
+print("\nSaved: nl_mean_only_no_sign_noL_summary.csv, nl_mean_only_no_sign_noL_details.csv, nl_mean_only_no_sign_noL_summary_and_details.xlsx")
+print("\n=== Summary (s=2) ===")
+print(summary_df.to_string(index=False))
