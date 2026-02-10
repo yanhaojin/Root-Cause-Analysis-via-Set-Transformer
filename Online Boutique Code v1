@@ -1,0 +1,594 @@
+!pip -q install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+!pip -q install numpy scikit-learn tqdm requests
+
+
+!apt-get -qq update
+!apt-get -qq install -y docker.io conntrack socat iptables -qq
+
+# start docker daemon
+!dockerd --host=unix:///var/run/docker.sock --storage-driver=overlay2 > /content/dockerd.log 2>&1 &
+!sleep 10
+!docker info | head -n 30
+
+# kubectl
+!curl -L -o /usr/local/bin/kubectl https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl
+!chmod +x /usr/local/bin/kubectl
+!kubectl version --client
+
+# kind
+!curl -L -o /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+!chmod +x /usr/local/bin/kind
+!kind version
+
+!kind create cluster --name ob --wait 120s
+!kubectl cluster-info
+
+!git clone --depth 1 https://github.com/GoogleCloudPlatform/microservices-demo.git
+!kubectl apply -f microservices-demo/release/kubernetes-manifests.yaml
+
+# wait pods
+!kubectl get pods
+!kubectl wait --for=condition=Ready pods --all --timeout=600s
+!kubectl get pods
+
+
+import os, pandas as pd, numpy as np, re
+
+RE1_OB_ROOT = "/content/data_rca/RE1-OB"  # adjust if yours differs
+
+def read_inject_time(path):
+    s = open(path, "r").read().strip()
+    try:
+        return float(s)
+    except:
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        return float(m.group(0)) if m else np.nan
+
+def infer_time_col(df):
+    for cand in ["time","timestamp","ts","Time","Timestamp"]:
+        if cand in df.columns:
+            return cand
+    return df.columns[0]
+
+pre_rows = 0
+post_rows = 0
+n_cases = 0
+
+for svc_fault in os.listdir(RE1_OB_ROOT):
+    p1 = os.path.join(RE1_OB_ROOT, svc_fault)
+    if not os.path.isdir(p1) or "_" not in svc_fault:
+        continue
+    for rep in os.listdir(p1):
+        p2 = os.path.join(p1, rep)
+        data_csv = os.path.join(p2, "data.csv")
+        inj_txt  = os.path.join(p2, "inject_time.txt")
+        if not (os.path.isfile(data_csv) and os.path.isfile(inj_txt)):
+            continue
+
+        inj = read_inject_time(inj_txt)
+        df = pd.read_csv(data_csv)
+        tcol = infer_time_col(df)
+        t = df[tcol].to_numpy(dtype=float)
+
+        pre_rows += int((t < inj).sum())
+        post_rows += int((t >= inj).sum())
+        n_cases += 1
+
+print("cases:", n_cases)
+print("observational time rows (pre-injection):", pre_rows)
+print("interventional time rows (post-injection):", post_rows)
+print("total rows:", pre_rows + post_rows)
+
+
+# ========================= 
+# - Downloads RCAEval RE1-OB (Online Boutique) telemetry dataset
+# - Builds per-case set-of-services features
+# - Trains a Set Transformer for root-cause SERVICE ranking/classification
+# - 60/40 train/test split
+# - Saves evaluation + training log to CSV
+# ======================== 
+
+!pip -q install pandas numpy scikit-learn tqdm requests
+
+import os, re, zipfile, random
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+
+# --------------------------
+# Reproducibility
+# --------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("DEVICE =", DEVICE)
+
+# ============================================================
+# 1) Download + unzip RE1-OB (Online Boutique) from Zenodo
+# ============================================================
+RE1_OB_URL = "https://zenodo.org/records/14590730/files/RE1-OB.zip?download=1"
+
+DATA_DIR = "/content/data_rca"
+ZIP_PATH = os.path.join(DATA_DIR, "RE1-OB.zip")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def download_file(url: str, out_path: str, chunk_size: int = 1 << 20):
+    import requests
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        print(f"[download] exists: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
+        return
+    print(f"[download] downloading: {url}")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        pbar = tqdm(total=total, unit="B", unit_scale=True)
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+        pbar.close()
+    print(f"[download] saved: {out_path}")
+
+def unzip(zip_path: str, out_dir: str):
+    # Extract into DATA_DIR (zip typically contains a folder RE1-OB/)
+    if os.path.isdir(out_dir) and len(os.listdir(out_dir)) > 0:
+        print(f"[unzip] exists: {out_dir}")
+        return
+    print(f"[unzip] extracting: {zip_path} -> {DATA_DIR}")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(DATA_DIR)
+    print("[unzip] done")
+
+download_file(RE1_OB_URL, ZIP_PATH)
+# We don't know exact folder nesting; unzip then locate RE1-OB directory robustly.
+unzip(ZIP_PATH, os.path.join(DATA_DIR, "RE1-OB"))
+
+def find_re1_ob_root(base_dir: str) -> str:
+    # Prefer exact match
+    cand = os.path.join(base_dir, "RE1-OB")
+    if os.path.isdir(cand):
+        return cand
+    # Otherwise search one level deep
+    for name in os.listdir(base_dir):
+        p = os.path.join(base_dir, name)
+        if os.path.isdir(p) and name.lower() == "re1-ob":
+            return p
+        # sometimes base_dir contains an extra folder which contains RE1-OB
+        p2 = os.path.join(p, "RE1-OB")
+        if os.path.isdir(p2):
+            return p2
+    raise FileNotFoundError("Could not locate RE1-OB folder after unzip.")
+
+EXTRACT_DIR = find_re1_ob_root(DATA_DIR)
+print("RE1-OB root:", EXTRACT_DIR)
+print("Top-level entries:", os.listdir(EXTRACT_DIR)[:10])
+
+# ============================================================
+# 2) Parse cases: RE1-OB/<service>_<fault>/<rep>/data.csv + inject_time.txt
+# ============================================================
+@dataclass
+class CaseMeta:
+    case_id: str
+    root_service: str
+    fault_type: str
+    data_csv: str
+    inject_time_txt: str
+
+def list_cases(re1_ob_root: str) -> List[CaseMeta]:
+    cases = []
+    for svc_fault in sorted(os.listdir(re1_ob_root)):
+        p1 = os.path.join(re1_ob_root, svc_fault)
+        if not os.path.isdir(p1):
+            continue
+        if "_" not in svc_fault:
+            continue
+        root_service, fault_type = svc_fault.split("_", 1)
+        for rep in sorted(os.listdir(p1), key=lambda x: int(x) if x.isdigit() else x):
+            p2 = os.path.join(p1, rep)
+            if not os.path.isdir(p2):
+                continue
+            data_csv = os.path.join(p2, "data.csv")
+            inj_txt  = os.path.join(p2, "inject_time.txt")
+            if os.path.isfile(data_csv) and os.path.isfile(inj_txt):
+                cases.append(CaseMeta(
+                    case_id=f"{svc_fault}/{rep}",
+                    root_service=root_service,
+                    fault_type=fault_type,
+                    data_csv=data_csv,
+                    inject_time_txt=inj_txt
+                ))
+    return cases
+
+all_cases = list_cases(EXTRACT_DIR)
+assert len(all_cases) > 0, "No cases found. Check dataset structure under EXTRACT_DIR."
+print("num_cases:", len(all_cases))
+print("sample:", all_cases[0])
+
+services = sorted({c.root_service for c in all_cases})
+service_to_idx = {s:i for i,s in enumerate(services)}
+idx_to_service = {i:s for s,i in service_to_idx.items()}
+print("num_services:", len(services))
+print("services:", services)
+
+# ============================================================
+# 3) Feature engineering: per-case -> [S, D_in] (S = num services)
+#    We compare pre-window vs post-window around injection time.
+# ============================================================
+def read_inject_time(path: str) -> float:
+    with open(path, "r") as f:
+        s = f.read().strip()
+    try:
+        return float(s)
+    except:
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        return float(m.group(0)) if m else 0.0
+
+def infer_time_and_metric_cols(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    cols = list(df.columns)
+    time_col = None
+    for cand in ["time", "timestamp", "ts", "Time", "Timestamp"]:
+        if cand in df.columns:
+            time_col = cand
+            break
+    if time_col is None:
+        time_col = cols[0]
+    time = df[time_col].to_numpy(dtype=float)
+    metric_cols = [c for c in cols if c != time_col]
+    return time, metric_cols
+
+def build_metric_to_service_map(metric_cols: List[str], services: List[str]) -> Dict[str, str]:
+    """
+    Robust-ish mapping: pick the LONGEST service name that appears as a token/prefix/substring in metric name.
+    """
+    services_sorted = sorted(services, key=len, reverse=True)
+    m2s = {}
+    for m in metric_cols:
+        mm = str(m).lower()
+        chosen = "__unknown__"
+        for s in services_sorted:
+            ss = s.lower()
+            # common patterns: prefix, token boundary, substring
+            if mm.startswith(ss) or f"{ss}_" in mm or f"{ss}-" in mm or f".{ss}" in mm or ss in mm:
+                chosen = s
+                break
+        m2s[m] = chosen
+    return m2s
+
+def metric_features(pre: np.ndarray, post: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    mu = float(np.mean(pre)) if pre.size else 0.0
+    sd = float(np.std(pre)) if pre.size else 0.0
+    sd = sd + eps
+    post_mu = float(np.mean(post)) if post.size else 0.0
+    post_sd = float(np.std(post)) if post.size else 0.0
+
+    z = (post - mu) / sd if post.size else np.array([0.0], dtype=float)
+    absz = np.abs(z)
+    max_absz = float(np.max(absz)) if absz.size else 0.0
+    mean_absz = float(np.mean(absz)) if absz.size else 0.0
+
+    delta_mu = (post_mu - mu) / (abs(mu) + eps)
+    delta_sd = (post_sd - sd) / (abs(sd) + eps)
+
+    return np.array([mu, sd, post_mu, post_sd, max_absz, mean_absz, delta_mu, delta_sd], dtype=np.float32)
+
+def case_to_service_features(
+    data_csv: str,
+    inject_time: float,
+    services: List[str],
+    pre_n: int = 300,
+    post_n: int = 300,
+) -> Tuple[np.ndarray, np.ndarray]:
+    df = pd.read_csv(data_csv)
+    time, metric_cols = infer_time_and_metric_cols(df)
+    m2s = build_metric_to_service_map(metric_cols, services)
+
+    inj_idx = int(np.argmin(np.abs(time - inject_time)))
+    pre_l = max(0, inj_idx - pre_n)
+    pre_r = inj_idx
+    post_l = inj_idx
+    post_r = min(len(time), inj_idx + post_n)
+
+    per_service_feats: Dict[str, List[np.ndarray]] = {s: [] for s in services}
+
+    for m in metric_cols:
+        arr = df[m].to_numpy(dtype=float)
+        pre = arr[pre_l:pre_r]
+        post = arr[post_l:post_r]
+        feat = metric_features(pre, post)
+        svc = m2s.get(m, "__unknown__")
+        if svc in per_service_feats:
+            per_service_feats[svc].append(feat)
+
+    S = len(services)
+    Dm = 8
+    # aggregate: mean(8) + max(8) + [num_metrics, top_anom] => 18 dims
+    X = np.zeros((S, 2*Dm + 2), dtype=np.float32)
+    M = np.ones((S,), dtype=np.bool_)
+
+    for i, svc in enumerate(services):
+        feats = per_service_feats[svc]
+        if len(feats) == 0:
+            M[i] = False
+            continue
+        Fm = np.stack(feats, axis=0)  # [M,8]
+        mean_feat = Fm.mean(axis=0)
+        max_feat  = Fm.max(axis=0)
+        num_metrics = float(Fm.shape[0])
+        top_anom = float(np.max(Fm[:, 4]))  # max_absz
+        X[i] = np.concatenate([mean_feat, max_feat, np.array([num_metrics, top_anom], dtype=np.float32)], axis=0)
+    return X, M
+
+def build_numpy_dataset(cases: List[CaseMeta], services: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[dict]]:
+    X_list, M_list, y_list, meta_list = [], [], [], []
+    for c in tqdm(cases, desc="featurizing cases"):
+        inj_time = read_inject_time(c.inject_time_txt)
+        X, M = case_to_service_features(c.data_csv, inj_time, services)
+        y = service_to_idx[c.root_service]
+        X_list.append(X)
+        M_list.append(M)
+        y_list.append(y)
+        meta_list.append({
+            "case_id": c.case_id,
+            "root_service": c.root_service,
+            "fault_type": c.fault_type,
+            "inject_time": inj_time,
+        })
+    return (
+        np.stack(X_list, axis=0).astype(np.float32),     # [N,S,D]
+        np.stack(M_list, axis=0).astype(np.bool_),       # [N,S]
+        np.array(y_list, dtype=np.int64),                # [N]
+        meta_list
+    )
+
+X_all, M_all, y_all, meta_all = build_numpy_dataset(all_cases, services)
+print("X_all:", X_all.shape, "M_all:", M_all.shape, "y_all:", y_all.shape)
+
+# ============================================================
+# 4) 60/40 split (stratified)
+# ============================================================
+idx = np.arange(len(y_all))
+train_idx, test_idx = train_test_split(
+    idx, test_size=0.40, random_state=SEED, stratify=y_all
+)
+
+X_tr, M_tr, y_tr = X_all[train_idx], M_all[train_idx], y_all[train_idx]
+X_te, M_te, y_te = X_all[test_idx],  M_all[test_idx],  y_all[test_idx]
+meta_tr = [meta_all[i] for i in train_idx]
+meta_te = [meta_all[i] for i in test_idx]
+print("train:", X_tr.shape, "test:", X_te.shape)
+
+# Standardize based on train valid entries
+def standardize_train_test(X_tr, M_tr, X_te, M_te, eps=1e-6):
+    flat_tr = X_tr[M_tr]  # [num_valid, D]
+    mu = flat_tr.mean(axis=0, keepdims=True)
+    sd = flat_tr.std(axis=0, keepdims=True) + eps
+    return (X_tr - mu) / sd, (X_te - mu) / sd, mu.squeeze(0), sd.squeeze(0)
+
+X_tr, X_te, feat_mu, feat_sd = standardize_train_test(X_tr, M_tr, X_te, M_te)
+D_IN = X_tr.shape[-1]
+print("D_IN =", D_IN)
+
+# ============================================================
+# 5) Dataset / DataLoader (FIXED meta batching via collate_fn)
+# ============================================================
+class NumpyRCADataset(Dataset):
+    def __init__(self, X, M, y, meta):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.M = torch.tensor(M, dtype=torch.bool)
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.meta = meta
+    def __len__(self):
+        return self.X.shape[0]
+    def __getitem__(self, i):
+        return self.X[i], self.M[i], self.y[i], self.meta[i]
+
+def collate_keep_meta(batch):
+    X, M, y, meta = zip(*batch)
+    return torch.stack(X, 0), torch.stack(M, 0), torch.stack(y, 0), list(meta)
+
+BATCH_SIZE = 16
+train_loader = DataLoader(
+    NumpyRCADataset(X_tr, M_tr, y_tr, meta_tr),
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    collate_fn=collate_keep_meta
+)
+test_loader = DataLoader(
+    NumpyRCADataset(X_te, M_te, y_te, meta_te),
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    collate_fn=collate_keep_meta
+)
+
+# ============================================================
+# 6) Set Transformer model (SAB blocks)
+# ============================================================
+class SAB(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_model),
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_out, _ = self.mha(x, x, x, key_padding_mask=key_padding_mask, need_weights=False)
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ff(x))
+        return x
+
+class SetTransformerRCA(nn.Module):
+    def __init__(self, d_in: int, d_model: int = 128, n_heads: int = 4, depth: int = 2, d_ff: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.in_proj = nn.Linear(d_in, d_model)
+        self.blocks = nn.ModuleList([SAB(d_model, n_heads, d_ff, dropout) for _ in range(depth)])
+        self.out = nn.Linear(d_model, 1)
+
+    def forward(self, x: torch.Tensor, msk: torch.Tensor) -> torch.Tensor:
+        # msk True=valid; MultiheadAttention uses key_padding_mask True=ignore
+        key_padding_mask = ~msk
+        h = self.in_proj(x)
+        for blk in self.blocks:
+            h = blk(h, key_padding_mask=key_padding_mask)
+        logits = self.out(h).squeeze(-1)        # [B,S]
+        logits = logits.masked_fill(~msk, -1e9) # never pick invalid
+        return logits
+
+model = SetTransformerRCA(d_in=D_IN, d_model=128, n_heads=4, depth=2, d_ff=256, dropout=0.0).to(DEVICE)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+# ============================================================
+# 7) Evaluation: AC@k and Avg@5 + per-case CSV rows
+# ============================================================
+@torch.no_grad()
+def evaluate_per_case(model, loader):
+    model.eval()
+    all_rows = []
+    for X, M, y, meta in loader:
+        X, M, y = X.to(DEVICE), M.to(DEVICE), y.to(DEVICE)
+        probs = F.softmax(model(X, M), dim=-1)
+        top = torch.argsort(probs, dim=-1, descending=True)  # [B,S]
+
+        B = y.shape[0]
+        for i in range(B):
+            true_idx = int(y[i].item())
+            ranking = top[i].detach().cpu().tolist()
+            top1 = ranking[0]
+            top5 = ranking[:5]
+            rank_true = ranking.index(true_idx) + 1
+            p_true = float(probs[i, true_idx].item())
+
+            all_rows.append({
+                "case_id": meta[i]["case_id"],
+                "fault_type": meta[i]["fault_type"],
+                "true_service": idx_to_service[true_idx],
+                "pred_top1": idx_to_service[top1],
+                "rank_true": rank_true,
+                "prob_true": p_true,
+                "top5": ",".join(idx_to_service[j] for j in top5),
+                "hit@1": int(true_idx in ranking[:1]),
+                "hit@2": int(true_idx in ranking[:2]),
+                "hit@3": int(true_idx in ranking[:3]),
+                "hit@4": int(true_idx in ranking[:4]),
+                "hit@5": int(true_idx in ranking[:5]),
+            })
+    return pd.DataFrame(all_rows)
+
+@torch.no_grad()
+def evaluate_ac_avg5(model, loader):
+    model.eval()
+    hits = {k: 0 for k in [1,2,3,4,5]}
+    mrr_sum = 0.0
+    n = 0
+    for X, M, y, _ in loader:
+        X, M, y = X.to(DEVICE), M.to(DEVICE), y.to(DEVICE)
+        probs = F.softmax(model(X, M), dim=-1)
+        top = torch.argsort(probs, dim=-1, descending=True)
+
+        for i in range(y.shape[0]):
+            true = int(y[i].item())
+            ranking = top[i].tolist()
+            pos = ranking.index(true) + 1
+            mrr_sum += 1.0 / pos
+            for k in [1,2,3,4,5]:
+                hits[k] += int(true in ranking[:k])
+            n += 1
+
+    ac = {f"AC@{k}": hits[k]/max(n,1) for k in [1,2,3,4,5]}
+    avg5 = sum(ac[f"AC@{k}"] for k in [1,2,3,4,5]) / 5.0
+    mrr = mrr_sum / max(n,1)
+    return {"n_cases": n, **ac, "Avg@5": avg5, "MRR": mrr}
+
+# ============================================================
+# 8) Train
+# ============================================================
+def train_one_epoch(model, loader):
+    model.train()
+    total_loss = 0.0
+    total = 0
+    correct = 0
+    for X, M, y, _ in loader:
+        X, M, y = X.to(DEVICE), M.to(DEVICE), y.to(DEVICE)
+        logits = model(X, M)
+        loss = F.cross_entropy(logits, y)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+
+        total_loss += float(loss.item()) * y.size(0)
+        total += y.size(0)
+        pred = torch.argmax(logits, dim=-1)
+        correct += int((pred == y).sum().item())
+
+    return total_loss / max(total,1), correct / max(total,1)
+
+EPOCHS = 1000
+train_log = []
+best_state = None
+best_avg5 = -1.0
+
+for epoch in range(1, EPOCHS+1):
+    tr_loss, tr_acc = train_one_epoch(model, train_loader)
+    te_metrics = evaluate_ac_avg5(model, test_loader)
+
+    row = {"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc, **te_metrics}
+    train_log.append(row)
+
+    if te_metrics["Avg@5"] > best_avg5:
+        best_avg5 = te_metrics["Avg@5"]
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if epoch == 1 or epoch % 5 == 0:
+        print(f"Epoch {epoch:02d} | loss {tr_loss:.4f} | train_acc {tr_acc:.3f} | "
+              f"Avg@5 {te_metrics['Avg@5']:.3f} | AC@1 {te_metrics['AC@1']:.3f} | MRR {te_metrics['MRR']:.3f}")
+
+if best_state is not None:
+    model.load_state_dict(best_state)
+print("Best Avg@5 =", best_avg5)
+
+# ============================================================
+# 9) Final eval + save CSVs
+# ============================================================
+OUT_DIR = "/content/rca_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+df_cases = evaluate_per_case(model, test_loader)
+summary = evaluate_ac_avg5(model, test_loader)
+df_summary = pd.DataFrame([{"metric": k, "value": v} for k,v in summary.items()])
+df_trainlog = pd.DataFrame(train_log)
+
+cases_csv = os.path.join(OUT_DIR, "evaluation_per_case.csv")
+summary_csv = os.path.join(OUT_DIR, "evaluation_summary.csv")
+trainlog_csv = os.path.join(OUT_DIR, "training_log.csv")
+
+df_cases.to_csv(cases_csv, index=False)
+df_summary.to_csv(summary_csv, index=False)
+df_trainlog.to_csv(trainlog_csv, index=False)
+
+print("\nSaved CSVs:")
+print(" -", cases_csv)
+print(" -", summary_csv)
+print(" -", trainlog_csv)
+
+display(df_summary)
+display(df_cases.head(10))
