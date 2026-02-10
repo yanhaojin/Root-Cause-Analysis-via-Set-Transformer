@@ -1,0 +1,891 @@
+# ===================== UPDATED EXPERIMENT CODE (Fix scheduler verbose arg) =====================
+# Implements 3) 4) 7):
+# 3) Rank among 12 candidate services (Table-5 style)
+# 4) More realistic synthetic data (moderate ratio, token dropout, feature jitter, delay/loss more spread)
+# 7) Training loop improvements (label smoothing, ReduceLROnPlateau, train acc + top1 hist, early stopping)
+# ==============================================================================================
+
+!pip -q install pandas numpy scikit-learn tqdm requests
+
+import os, re, zipfile, random, hashlib
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+
+# ---------------- Reproducibility ----------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("DEVICE =", DEVICE)
+
+# ===================== CONFIG =====================
+EPOCHS = 10000
+BATCH_SIZE = 32
+LR = 3e-4
+WEIGHT_DECAY = 0.0
+GRAD_STEPS = 2
+LABEL_SMOOTHING = 0.05
+EVAL_EVERY = 20
+PATIENCE_EVALS = 10**9
+
+PRE_N = 300
+POST_N = 300
+MAX_METRICS = 256
+
+TDELTAS = [0]
+
+METRIC_VOCAB = 8192
+
+FAULTS = ["CPU", "MEM", "DISK", "DELAY", "LOSS"]
+FAULT_MAP = {"cpu":"CPU","mem":"MEM","memory":"MEM","disk":"DISK","io":"DISK","delay":"DELAY","loss":"LOSS","packetloss":"LOSS"}
+fault_to_idx = {f:i for i,f in enumerate(FAULTS)}
+idx_to_fault = {i:f for f,i in fault_to_idx.items()}
+
+# Synthetic (4)
+ADD_SYNTHETIC = True
+SYN_RATIO = 1
+SYN_TOKEN_COUNT = 256
+SYN_TOKEN_DROPOUT_P = 0.30
+SYN_FEAT_JITTER_STD = 0.15
+SEM_EDGE_DENSITY = 0.3
+SEM_W_SCALE = 0.5
+SEM_NOISE_STD = 0.25
+SEM_SHIFT = 10
+
+OUT_DIR = "/content/rca_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ===================== Download RE1-OB =====================
+RE1_OB_URL = "https://zenodo.org/records/14590730/files/RE1-OB.zip?download=1"
+DATA_DIR = "/content/data_rca"
+ZIP_PATH = os.path.join(DATA_DIR, "RE1-OB.zip")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def download_file(url: str, out_path: str, chunk_size: int = 1 << 20):
+    import requests
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        print(f"[download] exists: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
+        return
+    print(f"[download] downloading: {url}")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        pbar = tqdm(total=total, unit="B", unit_scale=True)
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+        pbar.close()
+    print(f"[download] saved: {out_path}")
+
+def unzip(zip_path: str, base_out_dir: str):
+    if os.path.isdir(base_out_dir) and len(os.listdir(base_out_dir)) > 0:
+        print(f"[unzip] exists: {base_out_dir}")
+        return
+    print(f"[unzip] extracting: {zip_path} -> {DATA_DIR}")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(DATA_DIR)
+    print("[unzip] done")
+
+download_file(RE1_OB_URL, ZIP_PATH)
+unzip(ZIP_PATH, os.path.join(DATA_DIR, "RE1-OB"))
+
+def find_re1_ob_root(base_dir: str) -> str:
+    cand = os.path.join(base_dir, "RE1-OB")
+    if os.path.isdir(cand):
+        return cand
+    for name in os.listdir(base_dir):
+        p = os.path.join(base_dir, name)
+        if os.path.isdir(p) and name.lower() == "re1-ob":
+            return p
+        p2 = os.path.join(p, "RE1-OB")
+        if os.path.isdir(p2):
+            return p2
+    raise FileNotFoundError("Could not locate RE1-OB folder after unzip.")
+
+RE1_ROOT = find_re1_ob_root(DATA_DIR)
+print("RE1-OB root:", RE1_ROOT)
+
+# ===================== Parse cases =====================
+@dataclass
+class CaseMeta:
+    case_id: str
+    root_service: str
+    fault_type: str
+    data_csv: str
+    inject_time_txt: str
+
+def parse_fault(svc_fault: str) -> str:
+    if "_" not in svc_fault:
+        return None
+    suffix = svc_fault.split("_")[-1].lower().replace("-", "").replace(" ", "")
+    return FAULT_MAP.get(suffix, None)
+
+def list_cases(re1_root: str) -> List[CaseMeta]:
+    cases = []
+    for svc_fault in sorted(os.listdir(re1_root)):
+        p1 = os.path.join(re1_root, svc_fault)
+        if not os.path.isdir(p1):
+            continue
+        if "_" not in svc_fault:
+            continue
+        fault = parse_fault(svc_fault)
+        if fault is None:
+            continue
+        root_service = "_".join(svc_fault.split("_")[:-1])
+        for rep in sorted(os.listdir(p1), key=lambda x: int(x) if x.isdigit() else x):
+            p2 = os.path.join(p1, rep)
+            if not os.path.isdir(p2):
+                continue
+            data_csv = os.path.join(p2, "data.csv")
+            inj_txt  = os.path.join(p2, "inject_time.txt")
+            if os.path.isfile(data_csv) and os.path.isfile(inj_txt):
+                cases.append(CaseMeta(
+                    case_id=f"{svc_fault}/{rep}",
+                    root_service=root_service,
+                    fault_type=fault,
+                    data_csv=data_csv,
+                    inject_time_txt=inj_txt
+                ))
+    return cases
+
+all_cases = list_cases(RE1_ROOT)
+assert len(all_cases) > 0, "No cases found."
+print("num_cases:", len(all_cases))
+
+injected_services = sorted({c.root_service for c in all_cases})
+print("Injected services (labels):", injected_services)
+
+# ===================== Candidate services (12-way) =====================
+KNOWN_OB_SERVICES_FALLBACK = [
+    "frontend","adservice","cartservice","checkoutservice","currencyservice","emailservice",
+    "paymentservice","productcatalogservice","recommendationservice","shippingservice","redis-cart","loadgenerator"
+]
+def norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+def infer_time_and_metric_cols(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    cols = list(df.columns)
+    time_col = None
+    for cand in ["time", "timestamp", "ts", "Time", "Timestamp"]:
+        if cand in df.columns:
+            time_col = cand
+            break
+    if time_col is None:
+        time_col = cols[0]
+    time = pd.to_numeric(df[time_col], errors="coerce").to_numpy()
+    if not np.isfinite(time).all():
+        time = np.arange(len(df), dtype=float)
+    metric_cols = [c for c in cols if c != time_col]
+    return time.astype(float), metric_cols
+
+def extract_candidate_services(cases: List[CaseMeta], target_n: int = 12, scan_files: int = 30) -> List[str]:
+    freq: Dict[str,int] = {}
+    for c in cases[:min(scan_files, len(cases))]:
+        try:
+            df = pd.read_csv(c.data_csv, nrows=5)
+            _, metric_cols = infer_time_and_metric_cols(df)
+        except Exception:
+            continue
+        for col in metric_cols:
+            s = str(col).lower()
+            for m in re.findall(r"[a-z0-9\-]*service", s):
+                if len(m) >= 4:
+                    freq[m] = freq.get(m, 0) + 1
+            for m in ["frontend","redis-cart","loadgenerator","redis"]:
+                if m in s:
+                    freq[m] = freq.get(m, 0) + 1
+
+    cand = [k for k,_ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))]
+    out, seen = [], set()
+    for x in cand:
+        x = x.strip().lower()
+        if x == "redis":
+            x = "redis-cart"
+        if x not in seen:
+            out.append(x); seen.add(x)
+
+    for s in injected_services:
+        s = s.lower()
+        if s not in seen:
+            out.append(s); seen.add(s)
+
+    for s in KNOWN_OB_SERVICES_FALLBACK:
+        if len(out) >= target_n:
+            break
+        if s not in seen:
+            out.append(s); seen.add(s)
+
+    if len(out) > target_n:
+        injected_set = set([s.lower() for s in injected_services])
+        kept=[]
+        for s in out:
+            if s in injected_set and s not in kept:
+                kept.append(s)
+        for s in out:
+            if len(kept) >= target_n:
+                break
+            if s not in kept:
+                kept.append(s)
+        out = kept[:target_n]
+    return out
+
+candidate_services = extract_candidate_services(all_cases, 12, 30)
+S_ALL = len(candidate_services)
+print("\nCandidate services:", candidate_services)
+print("S_ALL =", S_ALL, "| Chance Avg@5 =", 3.0/S_ALL)
+
+cand_norm_map = {norm_name(s): i for i,s in enumerate(candidate_services)}
+def map_label_to_candidate(label: str) -> int:
+    key = norm_name(label)
+    if key in cand_norm_map:
+        return cand_norm_map[key]
+    key2 = key.replace("service","")
+    for k,i in cand_norm_map.items():
+        if k.replace("service","") == key2:
+            return i
+    raise KeyError(f"Label '{label}' not found in candidate set.")
+
+label_indices = [map_label_to_candidate(s) for s in injected_services]
+
+# ===================== Tokenization =====================
+def hash_metric(name: str, vocab: int) -> int:
+    h = hashlib.md5(name.encode("utf-8")).hexdigest()
+    v = int(h[:8], 16) % (vocab - 1)
+    return v + 1
+
+def read_inject_time(path: str) -> float:
+    s = open(path, "r").read().strip()
+    try:
+        return float(s)
+    except:
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        return float(m.group(0)) if m else 0.0
+
+def robust_slope(y: np.ndarray) -> float:
+    n = y.size
+    if n < 2:
+        return 0.0
+    x = np.arange(n, dtype=float)
+    x = x - x.mean()
+    denom = (x*x).sum()
+    if denom <= 1e-12:
+        return 0.0
+    return float((x * (y - y.mean())).sum() / denom)
+
+def token_features(pre: np.ndarray, post: np.ndarray, eps: float = 1e-6) -> Tuple[np.ndarray, float]:
+    pre_mu = float(np.mean(pre)) if pre.size else 0.0
+    pre_sd = float(np.std(pre)) if pre.size else 0.0
+    pre_sd = pre_sd + eps
+    post_mu = float(np.mean(post)) if post.size else 0.0
+    post_sd = float(np.std(post)) if post.size else 0.0
+
+    z = (post - pre_mu) / pre_sd if post.size else np.array([0.0], dtype=float)
+    absz = np.abs(z)
+    max_absz = float(np.max(absz)) if absz.size else 0.0
+    mean_absz = float(np.mean(absz)) if absz.size else 0.0
+
+    delta_mu = (post_mu - pre_mu) / (abs(pre_mu) + eps)
+    delta_sd = (post_sd - pre_sd) / (abs(pre_sd) + eps)
+
+    pre_sl = robust_slope(pre) if pre.size else 0.0
+    post_sl = robust_slope(post) if post.size else 0.0
+    delta_sl = post_sl - pre_sl
+
+    feat = np.array([
+        pre_mu, pre_sd, post_mu, post_sd,
+        delta_mu, delta_sd,
+        pre_sl, post_sl, delta_sl,
+        max_absz, mean_absz,
+        post_mu - pre_mu
+    ], dtype=np.float32)
+    return feat, max_absz
+
+def choose_inject_index(time: np.ndarray, inj: float) -> int:
+    tmin, tmax = float(np.min(time)), float(np.max(time))
+    if (inj < tmin - 1e-6) or (inj > tmax + 1e-6):
+        idx = int(round(inj))
+        if 0 <= idx < len(time):
+            return idx
+    return int(np.argmin(np.abs(time - inj)))
+
+def case_to_tokens(data_csv: str, inject_time: float, tdelta: float, max_metrics: int):
+    df = pd.read_csv(data_csv)
+    time, metric_cols = infer_time_and_metric_cols(df)
+    if len(metric_cols) == 0:
+        X = np.zeros((max_metrics, 12), dtype=np.float32)
+        ID = np.zeros((max_metrics,), dtype=np.int64)
+        M = np.zeros((max_metrics,), dtype=np.bool_)
+        M[0] = True
+        return X, ID, M
+
+    inj = inject_time + float(tdelta)
+    inj_idx = choose_inject_index(time, inj)
+    pre_l = max(0, inj_idx - PRE_N); pre_r = inj_idx
+    post_l = inj_idx; post_r = min(len(time), inj_idx + POST_N)
+
+    feats, ids, scores = [], [], []
+    for m in metric_cols:
+        arr = pd.to_numeric(df[m], errors="coerce").to_numpy(dtype=float)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        pre = arr[pre_l:pre_r]
+        post = arr[post_l:post_r]
+        f, sc = token_features(pre, post)
+        feats.append(f)
+        ids.append(hash_metric(str(m), METRIC_VOCAB))
+        scores.append(sc)
+
+    feats = np.stack(feats, axis=0)
+    ids = np.array(ids, dtype=np.int64)
+    scores = np.array(scores, dtype=float)
+
+    if feats.shape[0] > max_metrics:
+        top_k = max_metrics // 2
+        top_idx = np.argsort(scores)[::-1][:top_k]
+        rest = np.setdiff1d(np.arange(feats.shape[0]), top_idx, assume_unique=False)
+        if rest.size > 0:
+            rnd_idx = np.random.choice(rest, size=max_metrics - top_k, replace=False)
+            sel = np.concatenate([top_idx, rnd_idx])
+        else:
+            sel = top_idx
+        feats = feats[sel]
+        ids = ids[sel]
+
+    K = feats.shape[0]
+    X = np.zeros((max_metrics, 12), dtype=np.float32)
+    ID = np.zeros((max_metrics,), dtype=np.int64)
+    M = np.zeros((max_metrics,), dtype=np.bool_)
+    X[:K] = feats
+    ID[:K] = ids
+    M[:K] = True
+    if not M.any():
+        M[0] = True
+    return X, ID, M
+
+def build_arrays(cases: List[CaseMeta], tdelta: float):
+    Xs, IDs, Ms, ys, fs, metas = [], [], [], [], [], []
+    for c in tqdm(cases, desc=f"featurizing (tΔ={tdelta})"):
+        inj = read_inject_time(c.inject_time_txt)
+        X, ID, M = case_to_tokens(c.data_csv, inj, tdelta, MAX_METRICS)
+        Xs.append(X); IDs.append(ID); Ms.append(M)
+        ys.append(map_label_to_candidate(c.root_service))
+        fs.append(fault_to_idx[c.fault_type])
+        metas.append({"case_id": c.case_id, "root_service": c.root_service, "fault_type": c.fault_type})
+    return (
+        np.stack(Xs).astype(np.float32),
+        np.stack(IDs).astype(np.int64),
+        np.stack(Ms).astype(np.bool_),
+        np.array(ys, dtype=np.int64),
+        np.array(fs, dtype=np.int64),
+        metas
+    )
+
+# ===================== Synthetic pools =====================
+def tokenize_metric_name(name: str) -> List[str]:
+    return [t for t in re.split(r"[^a-zA-Z0-9\-]+", str(name).lower()) if t]
+
+cand_tokens = {norm_name(s): i for i,s in enumerate(candidate_services)}
+service_to_metric_ids: Dict[int, List[int]] = {i: [] for i in range(S_ALL)}
+all_metric_ids: List[int] = []
+
+def try_assign_candidate_service(metric_name: str) -> Optional[int]:
+    mm = str(metric_name).lower()
+    toks = tokenize_metric_name(mm)
+    for t in toks:
+        nt = norm_name(t)
+        if nt in cand_tokens:
+            return cand_tokens[nt]
+    nmm = norm_name(mm)
+    for s, idx in cand_tokens.items():
+        if s in nmm:
+            return idx
+    return None
+
+for c in all_cases[:min(40, len(all_cases))]:
+    try:
+        df = pd.read_csv(c.data_csv, nrows=5)
+        _, metric_cols = infer_time_and_metric_cols(df)
+    except Exception:
+        continue
+    for m in metric_cols:
+        mid = hash_metric(str(m), METRIC_VOCAB)
+        all_metric_ids.append(mid)
+        si = try_assign_candidate_service(m)
+        if si is not None:
+            service_to_metric_ids[si].append(mid)
+
+all_metric_ids = list(set(all_metric_ids))
+for si in range(S_ALL):
+    service_to_metric_ids[si] = list(set(service_to_metric_ids[si]))
+
+# ===================== Synthetic generator =====================
+def sample_B_lower(p: int, density: float, w_scale: float) -> np.ndarray:
+    B = np.zeros((p, p), dtype=np.float32)
+    for i in range(p):
+        for j in range(i):
+            if np.random.rand() < density:
+                B[i, j] = np.random.uniform(-w_scale, w_scale)
+    return B
+
+def sem_sample_scores(B: np.ndarray, noise_std: float, root: int, shift: float) -> np.ndarray:
+    p = B.shape[0]
+    I_minus_B = np.eye(p, dtype=np.float32) - B
+    eps = np.random.normal(0.0, noise_std, size=(p,)).astype(np.float32)
+    eps[root] += shift
+    x = np.linalg.solve(I_minus_B, eps).astype(np.float32)
+    x = x / (np.std(x) + 1e-6)
+    return x
+
+def fault_signature(fault: str):
+    if fault == "CPU":   return dict(mu=0.4, sd=0.3, slope=1.0, spike=0.8, spread=0.0)
+    if fault == "MEM":   return dict(mu=1.0, sd=0.4, slope=0.4, spike=0.6, spread=0.0)
+    if fault == "DISK":  return dict(mu=0.6, sd=1.0, slope=0.5, spike=0.8, spread=0.2)
+    if fault == "DELAY": return dict(mu=0.4, sd=0.4, slope=0.6, spike=1.2, spread=0.6)
+    if fault == "LOSS":  return dict(mu=0.2, sd=0.4, slope=0.3, spike=1.4, spread=0.8)
+    return dict(mu=0.5, sd=0.5, slope=0.5, spike=0.5, spread=0.2)
+
+def make_synthetic_case(B: np.ndarray, root_service_idx: int, fault_id: int, token_count: int):
+    scores = sem_sample_scores(B, SEM_NOISE_STD, root_service_idx, SEM_SHIFT)
+    fault = idx_to_fault[int(fault_id)]
+    sig = fault_signature(fault)
+
+    base = np.abs(scores) + 0.1
+    uni = np.ones_like(base)
+    weights = (1.0 - sig["spread"]) * base + sig["spread"] * uni
+    weights = weights / weights.sum()
+    counts = np.random.multinomial(token_count, weights)
+
+    feats_list, mids_list = [], []
+    for si in range(S_ALL):
+        n_i = counts[si]
+        if n_i <= 0:
+            continue
+        pool = service_to_metric_ids.get(si, [])
+        if len(pool) == 0:
+            pool = all_metric_ids if len(all_metric_ids) else [1]
+        chosen_mids = np.random.choice(pool, size=n_i, replace=True).astype(np.int64)
+
+        a = float(scores[si])
+        f = np.zeros((n_i, 12), dtype=np.float32)
+
+        mean_shift = sig["mu"] * a
+        sd_shift = sig["sd"] * abs(a)
+        slope_shift = sig["slope"] * a
+        spike = sig["spike"] * abs(a)
+
+        f[:, 0] = 0.0
+        f[:, 1] = 1.0
+        f[:, 2] = mean_shift
+        f[:, 3] = np.maximum(0.1, 1.0 + 0.2 * sd_shift)
+        f[:, 4] = mean_shift
+        f[:, 5] = sd_shift
+        f[:, 6] = 0.0
+        f[:, 7] = slope_shift
+        f[:, 8] = slope_shift
+        f[:, 9] = spike + np.random.uniform(0.0, 0.3, size=n_i)
+        f[:,10] = 0.6*spike + np.random.uniform(0.0, 0.2, size=n_i)
+        f[:,11] = mean_shift
+
+        f += np.random.normal(0.0, SYN_FEAT_JITTER_STD, size=f.shape).astype(np.float32)
+        feats_list.append(f)
+        mids_list.append(chosen_mids)
+
+    feats = np.concatenate(feats_list, axis=0) if len(feats_list) else np.zeros((1,12), dtype=np.float32)
+    mids  = np.concatenate(mids_list, axis=0) if len(mids_list) else np.zeros((1,), dtype=np.int64)
+
+    if feats.shape[0] > MAX_METRICS:
+        sel = np.random.choice(feats.shape[0], size=MAX_METRICS, replace=False)
+        feats = feats[sel]
+        mids = mids[sel]
+
+    K = feats.shape[0]
+    X = np.zeros((MAX_METRICS, 12), dtype=np.float32)
+    ID = np.zeros((MAX_METRICS,), dtype=np.int64)
+    M = np.zeros((MAX_METRICS,), dtype=np.bool_)
+    X[:K] = feats
+    ID[:K] = mids
+    M[:K] = True
+
+    # token dropout
+    if SYN_TOKEN_DROPOUT_P > 0 and M.sum() > 1:
+        keep = (np.random.rand(MAX_METRICS) > SYN_TOKEN_DROPOUT_P) & M
+        if keep.sum() == 0:
+            keep[np.argmax(M)] = True
+        M = keep
+        X[~M] = 0.0
+        ID[~M] = 0
+
+    return X, ID, M
+
+def build_synthetic_arrays(n_syn: int):
+    B = sample_B_lower(S_ALL, SEM_EDGE_DENSITY, SEM_W_SCALE)
+    Xs, IDs, Ms, ys, fs, metas = [], [], [], [], [], []
+    for i in range(n_syn):
+        root = int(np.random.choice(label_indices))  # only injected roots
+        fault_id = np.random.randint(0, len(FAULTS))
+        X, ID, M = make_synthetic_case(B, root, fault_id, SYN_TOKEN_COUNT)
+        Xs.append(X); IDs.append(ID); Ms.append(M)
+        ys.append(root); fs.append(fault_id)
+        metas.append({"case_id": f"synthetic_sem_{i:06d}", "root_service": candidate_services[root], "fault_type": idx_to_fault[fault_id]})
+    return np.stack(Xs).astype(np.float32), np.stack(IDs).astype(np.int64), np.stack(Ms).astype(np.bool_), np.array(ys, np.int64), np.array(fs, np.int64), metas
+
+# ===================== Model =====================
+class SAB(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff  = nn.Sequential(nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model))
+        self.ln2 = nn.LayerNorm(d_model)
+    def forward(self, x, key_padding_mask=None):
+        a,_ = self.mha(x,x,x, key_padding_mask=key_padding_mask, need_weights=False)
+        x = self.ln1(x + a)
+        x = self.ln2(x + self.ff(x))
+        return x
+
+class RCASetTransformer(nn.Module):
+    def __init__(self, num_services, num_faults, d_in, metric_vocab, d_model=128, n_heads=4, depth=2, d_ff=256):
+        super().__init__()
+        self.num_services = num_services
+        self.in_proj = nn.Linear(d_in, d_model)
+        self.metric_emb = nn.Embedding(metric_vocab, d_model)
+        nn.init.zeros_(self.metric_emb.weight.data[0])
+        self.fault_tok_emb = nn.Embedding(num_faults, d_model)
+        self.enc = nn.ModuleList([SAB(d_model, n_heads, d_ff) for _ in range(depth)])
+        self.svc_q = nn.Embedding(num_services, d_model)
+        self.fault_q_emb = nn.Embedding(num_faults, d_model)
+        self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.lnq = nn.LayerNorm(d_model)
+        self.lno = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+
+    def forward(self, x, mid, m, f_id):
+        all_masked = (~m).all(dim=1)
+        if all_masked.any():
+            x = x.clone(); mid = mid.clone(); m = m.clone()
+            m[all_masked, 0] = True
+            x[all_masked, 0, :] = 0.0
+            mid[all_masked, 0] = 0
+        kpm = ~m
+        B = x.size(0)
+        f_tok = self.fault_tok_emb(f_id).unsqueeze(1)
+        h = self.in_proj(x) + self.metric_emb(mid) + f_tok
+        for blk in self.enc:
+            h = blk(h, key_padding_mask=kpm)
+        svc_ids = torch.arange(self.num_services, device=x.device).unsqueeze(0).expand(B, -1)
+        q = self.svc_q(svc_ids) + self.fault_q_emb(f_id).unsqueeze(1)
+        q = self.lnq(q)
+        z,_ = self.cross(q, h, h, key_padding_mask=kpm, need_weights=False)
+        z = self.lno(z)
+        return self.head(z).squeeze(-1)
+
+# ===================== Eval helpers =====================
+@torch.no_grad()
+def eval_settransformer(model, loader):
+    model.eval()
+    rows=[]
+    for X,ID,M,f_id,y,meta in loader:
+        X,ID,M,f_id,y = X.to(DEVICE), ID.to(DEVICE), M.to(DEVICE), f_id.to(DEVICE), y.to(DEVICE)
+        probs = F.softmax(model(X,ID,M,f_id), dim=-1)
+        top = torch.argsort(probs, dim=-1, descending=True)
+        for i in range(y.size(0)):
+            true = int(y[i].item())
+            ranking = top[i].detach().cpu().tolist()
+            rows.append({
+                "case_id": meta[i]["case_id"],
+                "fault_type": meta[i]["fault_type"],
+                "true_service": candidate_services[true],
+                "pred_top1": candidate_services[ranking[0]],
+                "rank_true": ranking.index(true)+1,
+                **{f"hit@{k}": int(true in ranking[:k]) for k in [1,2,3,4,5]}
+            })
+    return pd.DataFrame(rows)
+
+def summarize_by_fault_df(df_cases: pd.DataFrame) -> pd.DataFrame:
+    out=[]
+    for fault in ["OVERALL"] + FAULTS:
+        sub = df_cases if fault=="OVERALL" else df_cases[df_cases["fault_type"]==fault]
+        if len(sub)==0: continue
+        ac = [sub[f"hit@{k}"].mean() for k in [1,2,3,4,5]]
+        out.append({"fault":fault,"n":len(sub),
+                    "AC@1":ac[0],"AC@2":ac[1],"AC@3":ac[2],"AC@4":ac[3],"AC@5":ac[4],
+                    "Avg@5":float(np.mean(ac))})
+    return pd.DataFrame(out)
+
+def table_row(summary: pd.DataFrame, method: str) -> Dict:
+    row={"method":method}
+    for f in FAULTS:
+        v = summary.loc[summary["fault"]==f,"Avg@5"]
+        row[f] = float(v.iloc[0]) if len(v) else np.nan
+    return row
+
+# BARO
+def baro_rank_case(case: CaseMeta, tdelta: float, eps: float = 1e-6):
+    df = pd.read_csv(case.data_csv)
+    time, metric_cols = infer_time_and_metric_cols(df)
+    inj = read_inject_time(case.inject_time_txt) + float(tdelta)
+    inj_idx = choose_inject_index(time, inj)
+    pre_l = max(0, inj_idx-PRE_N); pre_r = inj_idx
+    post_l = inj_idx; post_r = min(len(df), inj_idx+POST_N)
+
+    if len(metric_cols)==0 or pre_r<=pre_l or post_r<=post_l:
+        svc_scores = np.zeros((S_ALL,), dtype=np.float32)
+        return np.argsort(-svc_scores).tolist()
+
+    pre = df.iloc[pre_l:pre_r][metric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    post = df.iloc[post_l:post_r][metric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    med = pre.median(axis=0)
+    iqr = (pre.quantile(0.75, axis=0) - pre.quantile(0.25, axis=0)).replace(0.0, eps).fillna(1.0)
+    metric_score = ((post - med).abs() / iqr).max(axis=0).fillna(0.0)
+
+    s_sorted = sorted([s.lower() for s in candidate_services], key=len, reverse=True)
+    m2svc={}
+    for m in metric_cols:
+        mm = str(m).lower()
+        hit=None
+        for s in s_sorted:
+            if s in mm:
+                hit=s; break
+        m2svc[m]=hit
+
+    svc_scores = np.zeros((S_ALL,), dtype=np.float32)
+    for j, svc in enumerate(candidate_services):
+        cols = [m for m in metric_cols if m2svc.get(m,None)==svc.lower()]
+        svc_scores[j] = float(metric_score[cols].max()) if len(cols) else 0.0
+    return np.argsort(-svc_scores).tolist()
+
+def eval_baro(cases_subset: List[CaseMeta], tdelta: float):
+    rows=[]
+    for c in cases_subset:
+        ranking = baro_rank_case(c, tdelta)
+        true = map_label_to_candidate(c.root_service)
+        rows.append({
+            "case_id": c.case_id,
+            "fault_type": c.fault_type,
+            "true_service": candidate_services[true],
+            "pred_top1": candidate_services[ranking[0]],
+            "rank_true": ranking.index(true)+1,
+            **{f"hit@{k}": int(true in ranking[:k]) for k in [1,2,3,4,5]}
+        })
+    return pd.DataFrame(rows)
+
+def eval_dummy(df_cases: pd.DataFrame, num_services: int):
+    rng = np.random.default_rng(SEED)
+    rows=[]
+    for _, r in df_cases.iterrows():
+        true = cand_norm_map[norm_name(r["true_service"])]
+        ranking = rng.permutation(num_services).tolist()
+        rows.append({"fault_type": r["fault_type"], **{f"hit@{k}": int(true in ranking[:k]) for k in [1,2,3,4,5]}})
+    return pd.DataFrame(rows)
+
+# ===================== Dataset/Loader =====================
+class DS(Dataset):
+    def __init__(self, X, ID, M, f, y, meta):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.ID = torch.tensor(ID, dtype=torch.long)
+        self.M = torch.tensor(M, dtype=torch.bool)
+        self.f = torch.tensor(f, dtype=torch.long)
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.meta = meta
+    def __len__(self): return self.X.shape[0]
+    def __getitem__(self, i): return self.X[i], self.ID[i], self.M[i], self.f[i], self.y[i], self.meta[i]
+
+def collate_keep_meta(batch):
+    X, ID, M, f, y, meta = zip(*batch)
+    return torch.stack(X,0), torch.stack(ID,0), torch.stack(M,0), torch.stack(f,0), torch.stack(y,0), list(meta)
+
+# ===================== Run experiments =====================
+for tdelta in TDELTAS:
+    X_all, ID_all, M_all, y_all, f_all, meta_all = build_arrays(all_cases, tdelta)
+
+    combo = y_all * len(FAULTS) + f_all
+    idx = np.arange(len(y_all))
+    tr_idx, te_idx = train_test_split(idx, test_size=0.40, random_state=SEED, stratify=combo)
+
+    X_tr, ID_tr, M_tr, y_tr, f_tr = X_all[tr_idx], ID_all[tr_idx], M_all[tr_idx], y_all[tr_idx], f_all[tr_idx]
+    X_te, ID_te, M_te, y_te, f_te = X_all[te_idx], ID_all[te_idx], M_all[te_idx], y_all[te_idx], f_all[te_idx]
+    meta_tr = [meta_all[i] for i in tr_idx]
+    meta_te = [meta_all[i] for i in te_idx]
+    test_cases = [all_cases[i] for i in te_idx]
+
+    # standardize using REAL train tokens
+    flat = X_tr[M_tr]
+    mu = flat.mean(axis=0, keepdims=True)
+    sd = flat.std(axis=0, keepdims=True) + 1e-6
+    X_tr = np.nan_to_num((X_tr - mu)/sd, nan=0.0, posinf=0.0, neginf=0.0)
+    X_te = np.nan_to_num((X_te - mu)/sd, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # add synthetic (4)
+    if ADD_SYNTHETIC:
+        n_syn = int(SYN_RATIO * len(X_tr))
+        print(f"\n[tΔ={tdelta}] Adding synthetic TRAIN cases: {n_syn} (ratio={SYN_RATIO})")
+        X_syn, ID_syn, M_syn, y_syn, f_syn, meta_syn = build_synthetic_arrays(n_syn)
+        X_syn = np.nan_to_num((X_syn - mu)/sd, nan=0.0, posinf=0.0, neginf=0.0)
+
+        X_tr = np.concatenate([X_tr, X_syn], axis=0)
+        ID_tr = np.concatenate([ID_tr, ID_syn], axis=0)
+        M_tr  = np.concatenate([M_tr,  M_syn], axis=0)
+        y_tr  = np.concatenate([y_tr,  y_syn], axis=0)
+        f_tr  = np.concatenate([f_tr,  f_syn], axis=0)
+        meta_tr = meta_tr + meta_syn
+
+    train_loader = DataLoader(DS(X_tr, ID_tr, M_tr, f_tr, y_tr, meta_tr),
+                              batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_keep_meta)
+    test_loader  = DataLoader(DS(X_te, ID_te, M_te, f_te, y_te, meta_te),
+                              batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_keep_meta)
+
+    model = RCASetTransformer(num_services=S_ALL, num_faults=len(FAULTS), d_in=X_tr.shape[-1], metric_vocab=METRIC_VOCAB).to(DEVICE)
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=2)  # fixed
+
+    # class weights
+    counts = np.bincount(y_tr, minlength=S_ALL).astype(np.float32)
+    present = counts > 0
+    w = np.ones((S_ALL,), dtype=np.float32)
+    w[present] = counts[present].sum() / (present.sum() * counts[present])
+    w[~present] = 0.0
+    w_t = torch.tensor(w, device=DEVICE)
+
+    train_log=[]
+    best_state=None
+    best_avg=-1.0
+    no_improve=0
+    global_steps=0
+    last_lr = opt.param_groups[0]["lr"]
+
+    for ep in range(1, EPOCHS+1):
+        model.train()
+        tot_loss, tot, correct = 0.0, 0, 0
+
+        opt.zero_grad(set_to_none=True)
+        for b,(X,ID,M,f_id,y,_) in enumerate(train_loader, start=1):
+            X,ID,M,f_id,y = X.to(DEVICE), ID.to(DEVICE), M.to(DEVICE), f_id.to(DEVICE), y.to(DEVICE)
+            logits = model(X,ID,M,f_id)
+            loss = F.cross_entropy(logits, y, weight=w_t, label_smoothing=LABEL_SMOOTHING) / GRAD_STEPS
+            loss.backward()
+
+            if b % GRAD_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                global_steps += 1
+
+            tot_loss += float(loss.item()) * y.size(0) * GRAD_STEPS
+            tot += y.size(0)
+            correct += int((logits.argmax(-1) == y).sum().item())
+
+        if (len(train_loader) % GRAD_STEPS) != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            global_steps += 1
+
+        train_acc = correct / max(tot,1)
+
+        if ep == 1 or ep % EVAL_EVERY == 0:
+            df_st = eval_settransformer(model, test_loader)
+            summ_st = summarize_by_fault_df(df_st)
+            overall = float(summ_st.loc[summ_st["fault"]=="OVERALL","Avg@5"].iloc[0])
+
+            scheduler.step(overall)
+            new_lr = opt.param_groups[0]["lr"]
+            if new_lr != last_lr:
+                print(f"  [lr change] {last_lr:.2e} -> {new_lr:.2e}")
+                last_lr = new_lr
+
+            top1_counts = df_st["pred_top1"].value_counts().to_dict()
+
+            train_log.append({
+                "epoch": ep,
+                "global_steps": global_steps,
+                "lr": new_lr,
+                "train_loss": tot_loss/max(tot,1),
+                "train_acc": train_acc,
+                "test_Avg@5": overall,
+                "test_top1_dist": str(top1_counts)[:4000]
+            })
+
+            print(f"[tΔ={tdelta}] epoch {ep:03d} | lr {new_lr:.2e} | train_loss {tot_loss/max(tot,1):.4f} "
+                  f"| train_acc {train_acc:.3f} | test Avg@5 {overall:.3f}")
+            print("  test top-1 counts (head):", dict(list(top1_counts.items())[:6]))
+
+            if overall > best_avg + 1e-6:
+                best_avg = overall
+                best_state = {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= PATIENCE_EVALS:
+                    print(f"Early stopping triggered (no improvement for {PATIENCE_EVALS} evals).")
+                    break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Final evaluation
+    df_st = eval_settransformer(model, test_loader)
+    st_summary = summarize_by_fault_df(df_st)
+
+    df_baro = eval_baro(test_cases, tdelta)
+    baro_summary = summarize_by_fault_df(df_baro)
+
+    df_dummy = eval_dummy(df_st, S_ALL)
+    dummy_rows=[]
+    for fault in ["OVERALL"] + FAULTS:
+        mask = np.ones(len(df_dummy), dtype=bool) if fault=="OVERALL" else (df_st["fault_type"].values == fault)
+        if mask.sum()==0: continue
+        ac = [df_dummy.loc[mask, f"hit@{k}"].mean() for k in [1,2,3,4,5]]
+        dummy_rows.append({"fault": fault, "n": int(mask.sum()),
+                           "AC@1": ac[0], "AC@2": ac[1], "AC@3": ac[2], "AC@4": ac[3], "AC@5": ac[4],
+                           "Avg@5": float(np.mean(ac))})
+    dummy_summary = pd.DataFrame(dummy_rows)
+
+    compare = pd.DataFrame([
+        table_row(st_summary,   method=f"SetTransformer(+syn={ADD_SYNTHETIC},ratio={SYN_RATIO})"),
+        table_row(baro_summary, method="BARO (RobustScorer median/IQR)"),
+        table_row(dummy_summary,method="Dummy (random ranking)")
+    ])
+
+    # Save CSVs
+    df_st.to_csv(os.path.join(OUT_DIR, f"per_case_settransformer_tdelta_{tdelta}.csv"), index=False)
+    df_baro.to_csv(os.path.join(OUT_DIR, f"per_case_baro_tdelta_{tdelta}.csv"), index=False)
+    st_summary.to_csv(os.path.join(OUT_DIR, f"summary_by_fault_settransformer_tdelta_{tdelta}.csv"), index=False)
+    baro_summary.to_csv(os.path.join(OUT_DIR, f"summary_by_fault_baro_tdelta_{tdelta}.csv"), index=False)
+    dummy_summary.to_csv(os.path.join(OUT_DIR, f"summary_by_fault_dummy_tdelta_{tdelta}.csv"), index=False)
+    compare.to_csv(os.path.join(OUT_DIR, f"table_compare_tdelta_{tdelta}.csv"), index=False)
+    pd.DataFrame(train_log).to_csv(os.path.join(OUT_DIR, f"trainlog_settransformer_tdelta_{tdelta}.csv"), index=False)
+
+    print(f"\n[tΔ={tdelta}] OVERALL Avg@5: ST={float(st_summary.loc[st_summary.fault=='OVERALL','Avg@5'].iloc[0]):.3f} | "
+          f"BARO={float(baro_summary.loc[baro_summary.fault=='OVERALL','Avg@5'].iloc[0]):.3f} | "
+          f"Dummy={float(dummy_summary.loc[dummy_summary.fault=='OVERALL','Avg@5'].iloc[0]):.3f}")
+    display(compare)
+
+# Zip + download
+try:
+    from google.colab import files
+    zip_path="/content/rca_experiment_updated_3_4_7.zip"
+    !zip -j {zip_path} {OUT_DIR}/*.csv
+    files.download(zip_path)
+except Exception as e:
+    print("\n[Note] Auto-download works only in Colab. Download manually from Files pane:", OUT_DIR)
+    print("Error:", repr(e))
