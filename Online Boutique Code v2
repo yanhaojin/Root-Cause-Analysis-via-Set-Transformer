@@ -1,0 +1,583 @@
+!pip -q install pandas numpy scikit-learn tqdm requests
+
+import os, re, zipfile, random
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+
+# --------------------------
+# Reproducibility
+# --------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("DEVICE =", DEVICE)
+
+# ============================================================
+# CONFIG
+# ============================================================
+EPOCHS = 500
+BATCH_SIZE = 16
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+
+# --- Synthetic augmentation (optional) ---
+USE_SYNTHETIC = True
+SYN_RATIO = 0.5            # add ~50% as many synthetic cases as real train cases
+B_DENSITY = 0.25           # probability an edge exists in B (below diagonal)
+B_WEIGHT_SCALE = 0.25      # edge weight magnitude
+NOISE_STD = 1.0            # epsilon std
+ANOMALY_SHIFT = 3.0        # shift to epsilon of root cause
+SYN_BASE_STD = 0.35        # base noise in standardized feature space
+EMBED_DIM = -1             # inject SEM scores into last feature coordinate
+
+# ============================================================
+# 1) Download + unzip RE1-OB (Online Boutique) from Zenodo
+# ============================================================
+RE1_OB_URL = "https://zenodo.org/records/14590730/files/RE1-OB.zip?download=1"
+
+DATA_DIR = "/content/data_rca"
+ZIP_PATH = os.path.join(DATA_DIR, "RE1-OB.zip")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def download_file(url: str, out_path: str, chunk_size: int = 1 << 20):
+    import requests
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        print(f"[download] exists: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
+        return
+    print(f"[download] downloading: {url}")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        pbar = tqdm(total=total, unit="B", unit_scale=True)
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+        pbar.close()
+    print(f"[download] saved: {out_path}")
+
+def unzip(zip_path: str, base_out_dir: str):
+    if os.path.isdir(base_out_dir) and len(os.listdir(base_out_dir)) > 0:
+        print(f"[unzip] exists: {base_out_dir}")
+        return
+    print(f"[unzip] extracting: {zip_path} -> {DATA_DIR}")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(DATA_DIR)
+    print("[unzip] done")
+
+download_file(RE1_OB_URL, ZIP_PATH)
+unzip(ZIP_PATH, os.path.join(DATA_DIR, "RE1-OB"))
+
+def find_re1_ob_root(base_dir: str) -> str:
+    cand = os.path.join(base_dir, "RE1-OB")
+    if os.path.isdir(cand):
+        return cand
+    for name in os.listdir(base_dir):
+        p = os.path.join(base_dir, name)
+        if os.path.isdir(p) and name.lower() == "re1-ob":
+            return p
+        p2 = os.path.join(p, "RE1-OB")
+        if os.path.isdir(p2):
+            return p2
+    raise FileNotFoundError("Could not locate RE1-OB folder after unzip.")
+
+EXTRACT_DIR = find_re1_ob_root(DATA_DIR)
+print("RE1-OB root:", EXTRACT_DIR)
+print("Top-level entries:", os.listdir(EXTRACT_DIR)[:10])
+
+# ============================================================
+# 2) Parse cases
+# ============================================================
+@dataclass
+class CaseMeta:
+    case_id: str
+    root_service: str
+    fault_type: str
+    data_csv: str
+    inject_time_txt: str
+
+def list_cases(re1_ob_root: str) -> List[CaseMeta]:
+    cases = []
+    for svc_fault in sorted(os.listdir(re1_ob_root)):
+        p1 = os.path.join(re1_ob_root, svc_fault)
+        if not os.path.isdir(p1):
+            continue
+        if "_" not in svc_fault:
+            continue
+        root_service, fault_type = svc_fault.split("_", 1)
+        for rep in sorted(os.listdir(p1), key=lambda x: int(x) if x.isdigit() else x):
+            p2 = os.path.join(p1, rep)
+            if not os.path.isdir(p2):
+                continue
+            data_csv = os.path.join(p2, "data.csv")
+            inj_txt  = os.path.join(p2, "inject_time.txt")
+            if os.path.isfile(data_csv) and os.path.isfile(inj_txt):
+                cases.append(CaseMeta(
+                    case_id=f"{svc_fault}/{rep}",
+                    root_service=root_service,
+                    fault_type=fault_type,
+                    data_csv=data_csv,
+                    inject_time_txt=inj_txt
+                ))
+    return cases
+
+all_cases = list_cases(EXTRACT_DIR)
+assert len(all_cases) > 0, "No cases found. Check dataset structure under EXTRACT_DIR."
+print("num_cases:", len(all_cases))
+print("sample:", all_cases[0])
+
+services = sorted({c.root_service for c in all_cases})
+service_to_idx = {s:i for i,s in enumerate(services)}
+idx_to_service = {i:s for s,i in service_to_idx.items()}
+S = len(services)
+print("num_services:", S, services)
+
+# ============================================================
+# 3) Feature engineering (NO service masking; missing metrics => num_metrics=0)
+#    Per-service feature dim: 18 (mean 8 + max 8 + [num_metrics, top_anom])
+# ============================================================
+def read_inject_time(path: str) -> float:
+    s = open(path, "r").read().strip()
+    try:
+        return float(s)
+    except:
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        return float(m.group(0)) if m else 0.0
+
+def infer_time_and_metric_cols(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    cols = list(df.columns)
+    time_col = None
+    for cand in ["time", "timestamp", "ts", "Time", "Timestamp"]:
+        if cand in df.columns:
+            time_col = cand
+            break
+    if time_col is None:
+        time_col = cols[0]
+    time = df[time_col].to_numpy(dtype=float)
+    metric_cols = [c for c in cols if c != time_col]
+    return time, metric_cols
+
+def tokenize_metric_name(name: str) -> List[str]:
+    # Split on any non-alphanumeric; keep lowercase tokens
+    return [t for t in re.split(r"[^a-zA-Z0-9]+", name.lower()) if t]
+
+def build_metric_to_service_map(metric_cols: List[str], services: List[str]) -> Dict[str, str]:
+    # Prefer exact token matches (strongest). Fallback to prefix match.
+    svc_set = set(s.lower() for s in services)
+    m2s = {}
+    for m in metric_cols:
+        mm = str(m)
+        tokens = tokenize_metric_name(mm)
+        chosen = None
+        # exact token match
+        for t in tokens:
+            if t in svc_set:
+                chosen = t
+                break
+        if chosen is None:
+            # prefix match / substring fallback
+            mml = mm.lower()
+            for s in sorted(services, key=len, reverse=True):
+                sl = s.lower()
+                if mml.startswith(sl + "_") or mml.startswith(sl + "-") or mml.startswith(sl):
+                    chosen = sl
+                    break
+        if chosen is None:
+            chosen = "__unknown__"
+        # map back to original service casing if found
+        if chosen != "__unknown__":
+            for s in services:
+                if s.lower() == chosen:
+                    m2s[m] = s
+                    break
+        else:
+            m2s[m] = "__unknown__"
+    return m2s
+
+def metric_features(pre: np.ndarray, post: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    mu = float(np.mean(pre)) if pre.size else 0.0
+    sd = float(np.std(pre)) if pre.size else 0.0
+    sd = sd + eps
+    post_mu = float(np.mean(post)) if post.size else 0.0
+    post_sd = float(np.std(post)) if post.size else 0.0
+
+    z = (post - mu) / sd if post.size else np.array([0.0], dtype=float)
+    absz = np.abs(z)
+    max_absz = float(np.max(absz)) if absz.size else 0.0
+    mean_absz = float(np.mean(absz)) if absz.size else 0.0
+
+    delta_mu = (post_mu - mu) / (abs(mu) + eps)
+    delta_sd = (post_sd - sd) / (abs(sd) + eps)
+
+    return np.array([mu, sd, post_mu, post_sd, max_absz, mean_absz, delta_mu, delta_sd], dtype=np.float32)
+
+def case_to_service_features(
+    data_csv: str,
+    inject_time: float,
+    services: List[str],
+    pre_n: int = 300,
+    post_n: int = 300,
+) -> np.ndarray:
+    df = pd.read_csv(data_csv)
+    time, metric_cols = infer_time_and_metric_cols(df)
+    m2s = build_metric_to_service_map(metric_cols, services)
+
+    inj_idx = int(np.argmin(np.abs(time - inject_time)))
+    pre_l = max(0, inj_idx - pre_n)
+    pre_r = inj_idx
+    post_l = inj_idx
+    post_r = min(len(time), inj_idx + post_n)
+
+    per_service_feats: Dict[str, List[np.ndarray]] = {s: [] for s in services}
+
+    for m in metric_cols:
+        svc = m2s.get(m, "__unknown__")
+        if svc not in per_service_feats:
+            continue
+        arr = df[m].to_numpy(dtype=float)
+        pre = arr[pre_l:pre_r]
+        post = arr[post_l:post_r]
+        per_service_feats[svc].append(metric_features(pre, post))
+
+    Dm = 8
+    X = np.zeros((len(services), 2*Dm + 2), dtype=np.float32)
+
+    for i, svc in enumerate(services):
+        feats = per_service_feats[svc]
+        if len(feats) == 0:
+            # num_metrics=0 already; keep zeros => model can learn "no signal"
+            X[i, -2] = 0.0  # num_metrics
+            X[i, -1] = 0.0  # top_anom
+            continue
+        Fm = np.stack(feats, axis=0)  # [M,8]
+        mean_feat = Fm.mean(axis=0)
+        max_feat  = Fm.max(axis=0)
+        num_metrics = float(Fm.shape[0])
+        top_anom = float(np.max(Fm[:, 4]))  # max_absz
+        X[i] = np.concatenate([mean_feat, max_feat, np.array([num_metrics, top_anom], dtype=np.float32)], axis=0)
+
+    return X
+
+def build_numpy_dataset(cases: List[CaseMeta], services: List[str]) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
+    X_list, y_list, meta_list = [], [], []
+    for c in tqdm(cases, desc="featurizing cases"):
+        inj_time = read_inject_time(c.inject_time_txt)
+        X = case_to_service_features(c.data_csv, inj_time, services)  # [S,D]
+        y = service_to_idx[c.root_service]
+        X_list.append(X)
+        y_list.append(y)
+        meta_list.append({
+            "case_id": c.case_id,
+            "root_service": c.root_service,
+            "fault_type": c.fault_type,
+            "inject_time": inj_time,
+        })
+    X_all = np.stack(X_list, axis=0).astype(np.float32)  # [N,S,D]
+    y_all = np.array(y_list, dtype=np.int64)             # [N]
+    return X_all, y_all, meta_list
+
+X_all, y_all, meta_all = build_numpy_dataset(all_cases, services)
+print("X_all:", X_all.shape, "y_all:", y_all.shape)
+
+# All services are valid (no masking)
+M_all = np.ones((X_all.shape[0], S), dtype=np.bool_)
+
+# ============================================================
+# 4) 60/40 split (stratified)
+# ============================================================
+idx = np.arange(len(y_all))
+train_idx, test_idx = train_test_split(idx, test_size=0.40, random_state=SEED, stratify=y_all)
+
+X_tr, y_tr = X_all[train_idx], y_all[train_idx]
+X_te, y_te = X_all[test_idx],  y_all[test_idx]
+M_tr = np.ones((len(train_idx), S), dtype=np.bool_)
+M_te = np.ones((len(test_idx),  S), dtype=np.bool_)
+meta_tr = [meta_all[i] for i in train_idx]
+meta_te = [meta_all[i] for i in test_idx]
+
+print("train:", X_tr.shape, "test:", X_te.shape)
+
+# ============================================================
+# 5) Standardize using TRAIN entries (all services valid)
+# ============================================================
+def standardize_train_test(X_tr, X_te, eps=1e-6):
+    flat_tr = X_tr.reshape(-1, X_tr.shape[-1])
+    mu = flat_tr.mean(axis=0, keepdims=True)
+    sd = flat_tr.std(axis=0, keepdims=True) + eps
+    return (X_tr - mu) / sd, (X_te - mu) / sd, mu.squeeze(0), sd.squeeze(0)
+
+X_tr, X_te, feat_mu, feat_sd = standardize_train_test(X_tr, X_te)
+D_IN = X_tr.shape[-1]
+print("D_IN =", D_IN)
+
+# Debug: check within-case variability (if near 0, features are too similar)
+print("Avg within-case std across services (train, first 10 cases):",
+      float(np.mean([X_tr[i].std(axis=0).mean() for i in range(min(10, len(X_tr)))])))
+
+# ============================================================
+# 6) OPTIONAL: SEM synthetic augmentation (added ONLY to training set)
+# ============================================================
+def sample_strictly_lower_triangular_B(p: int, density: float, weight_scale: float) -> np.ndarray:
+    B = np.zeros((p, p), dtype=np.float32)
+    for i in range(p):
+        for j in range(i):
+            if np.random.rand() < density:
+                B[i, j] = np.random.uniform(-weight_scale, weight_scale)
+    return B
+
+def sem_generate_scores(B: np.ndarray, noise_std: float, root_idx: int, anomaly_shift: float) -> np.ndarray:
+    p = B.shape[0]
+    I_minus_B = np.eye(p, dtype=np.float32) - B
+    eps = np.random.normal(0.0, noise_std, size=(p,)).astype(np.float32)
+    eps[root_idx] += anomaly_shift
+    x = np.linalg.solve(I_minus_B, eps).astype(np.float32)
+    x = x / (np.std(x) + 1e-6)
+    return x
+
+def make_synthetic_cases(n_syn: int, S: int, D_in: int, embed_dim: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[dict]]:
+    B = sample_strictly_lower_triangular_B(S, B_DENSITY, B_WEIGHT_SCALE)
+    X_syn = np.random.normal(0.0, SYN_BASE_STD, size=(n_syn, S, D_in)).astype(np.float32)
+    M_syn = np.ones((n_syn, S), dtype=np.bool_)
+    y_syn = np.zeros((n_syn,), dtype=np.int64)
+    meta_syn = []
+    for i in range(n_syn):
+        r = np.random.randint(0, S)
+        scores = sem_generate_scores(B, NOISE_STD, r, ANOMALY_SHIFT)
+        X_syn[i, :, embed_dim] += scores
+        y_syn[i] = r
+        meta_syn.append({
+            "case_id": f"synthetic_sem_{i:06d}",
+            "root_service": idx_to_service[r],
+            "fault_type": "SEM",
+            "inject_time": float("nan"),
+        })
+    return X_syn, M_syn, y_syn, meta_syn
+
+if USE_SYNTHETIC:
+    n_syn = int(len(X_tr) * SYN_RATIO)
+    print(f"Adding synthetic training cases: {n_syn} (ratio={SYN_RATIO})")
+    X_syn, M_syn, y_syn, meta_syn = make_synthetic_cases(n_syn, S, D_IN, EMBED_DIM)
+    X_tr = np.concatenate([X_tr, X_syn], axis=0)
+    M_tr = np.concatenate([M_tr, M_syn], axis=0)
+    y_tr = np.concatenate([y_tr, y_syn], axis=0)
+    meta_tr = meta_tr + meta_syn
+    print("train_aug:", X_tr.shape)
+
+# ============================================================
+# 7) Dataset / DataLoader (meta-safe collate_fn)
+# ============================================================
+class NumpyRCADataset(Dataset):
+    def __init__(self, X, M, y, meta):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.M = torch.tensor(M, dtype=torch.bool)
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.meta = meta
+    def __len__(self):
+        return self.X.shape[0]
+    def __getitem__(self, i):
+        return self.X[i], self.M[i], self.y[i], self.meta[i]
+
+def collate_keep_meta(batch):
+    X, M, y, meta = zip(*batch)
+    return torch.stack(X, 0), torch.stack(M, 0), torch.stack(y, 0), list(meta)
+
+train_loader = DataLoader(NumpyRCADataset(X_tr, M_tr, y_tr, meta_tr), batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_keep_meta)
+test_loader  = DataLoader(NumpyRCADataset(X_te, M_te, y_te, meta_te), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_keep_meta)
+
+# ============================================================
+# 8) Set Transformer model WITH service-id embedding (critical fix)
+# ============================================================
+class SAB(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model))
+        self.ln2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_out, _ = self.mha(x, x, x, key_padding_mask=key_padding_mask, need_weights=False)
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ff(x))
+        return x
+
+class SetTransformerRCA(nn.Module):
+    def __init__(self, num_services: int, d_in: int, d_model: int = 128, n_heads: int = 4, depth: int = 2, d_ff: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.num_services = num_services
+        self.in_proj = nn.Linear(d_in, d_model)
+        self.svc_emb = nn.Embedding(num_services, d_model)  # <-- breaks symmetry
+        self.blocks = nn.ModuleList([SAB(d_model, n_heads, d_ff, dropout) for _ in range(depth)])
+        self.out = nn.Linear(d_model, 1)
+
+    def forward(self, x: torch.Tensor, msk: torch.Tensor) -> torch.Tensor:
+        # msk True=valid; here we keep all valid, but keep logic anyway
+        key_padding_mask = ~msk
+
+        B, S_, _ = x.shape
+        svc_ids = torch.arange(S_, device=x.device).unsqueeze(0).expand(B, -1)
+        h = self.in_proj(x) + self.svc_emb(svc_ids)
+
+        for blk in self.blocks:
+            h = blk(h, key_padding_mask=key_padding_mask)
+
+        logits = self.out(h).squeeze(-1)
+        logits = logits.masked_fill(~msk, -1e9)
+        return logits
+
+model = SetTransformerRCA(num_services=S, d_in=D_IN, d_model=128, n_heads=4, depth=2, d_ff=256, dropout=0.0).to(DEVICE)
+opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+# ============================================================
+# 9) Weighted CE (helps imbalance)
+# ============================================================
+counts = np.bincount(y_tr, minlength=S).astype(np.float32)
+w = (counts.sum() / (S * np.maximum(counts, 1.0))).astype(np.float32)
+w_t = torch.tensor(w, device=DEVICE)
+print("train class counts:", counts.astype(int).tolist())
+print("class weights:", [round(float(x), 3) for x in w.tolist()])
+
+# ============================================================
+# 10) Evaluation (AC@k, Avg@5, MRR) + per-case table
+# ============================================================
+@torch.no_grad()
+def evaluate_per_case(model, loader):
+    model.eval()
+    rows = []
+    for X, M, y, meta in loader:
+        X, M, y = X.to(DEVICE), M.to(DEVICE), y.to(DEVICE)
+        probs = F.softmax(model(X, M), dim=-1)
+        top = torch.argsort(probs, dim=-1, descending=True)
+        for i in range(y.shape[0]):
+            true = int(y[i].item())
+            ranking = top[i].detach().cpu().tolist()
+            rows.append({
+                "case_id": meta[i]["case_id"],
+                "fault_type": meta[i]["fault_type"],
+                "true_service": idx_to_service[true],
+                "pred_top1": idx_to_service[ranking[0]],
+                "rank_true": ranking.index(true) + 1,
+                "prob_true": float(probs[i, true].item()),
+                "top5": ",".join(idx_to_service[j] for j in ranking[:5]),
+                "hit@1": int(true in ranking[:1]),
+                "hit@2": int(true in ranking[:2]),
+                "hit@3": int(true in ranking[:3]),
+                "hit@4": int(true in ranking[:4]),
+                "hit@5": int(true in ranking[:5]),
+            })
+    return pd.DataFrame(rows)
+
+@torch.no_grad()
+def evaluate_ac_avg5(model, loader):
+    model.eval()
+    hits = {k: 0 for k in [1,2,3,4,5]}
+    mrr_sum, n = 0.0, 0
+    for X, M, y, _ in loader:
+        X, M, y = X.to(DEVICE), M.to(DEVICE), y.to(DEVICE)
+        probs = F.softmax(model(X, M), dim=-1)
+        top = torch.argsort(probs, dim=-1, descending=True)
+        for i in range(y.shape[0]):
+            true = int(y[i].item())
+            ranking = top[i].tolist()
+            pos = ranking.index(true) + 1
+            mrr_sum += 1.0 / pos
+            for k in [1,2,3,4,5]:
+                hits[k] += int(true in ranking[:k])
+            n += 1
+    ac = {f"AC@{k}": hits[k]/max(n,1) for k in [1,2,3,4,5]}
+    avg5 = sum(ac[f"AC@{k}"] for k in [1,2,3,4,5]) / 5.0
+    return {"n_cases": n, **ac, "Avg@5": avg5, "MRR": mrr_sum/max(n,1)}
+
+# ============================================================
+# 11) Train
+# ============================================================
+def train_one_epoch(model, loader):
+    model.train()
+    total_loss, total, correct = 0.0, 0, 0
+    for X, M, y, _ in loader:
+        X, M, y = X.to(DEVICE), M.to(DEVICE), y.to(DEVICE)
+        logits = model(X, M)
+        loss = F.cross_entropy(logits, y, weight=w_t)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+
+        total_loss += float(loss.item()) * y.size(0)
+        total += y.size(0)
+        pred = torch.argmax(logits, dim=-1)
+        correct += int((pred == y).sum().item())
+    return total_loss / max(total,1), correct / max(total,1)
+
+train_log = []
+best_state, best_avg5 = None, -1.0
+
+for epoch in range(1, EPOCHS+1):
+    tr_loss, tr_acc = train_one_epoch(model, train_loader)
+    te = evaluate_ac_avg5(model, test_loader)
+    train_log.append({"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc, **te})
+
+    if te["Avg@5"] > best_avg5:
+        best_avg5 = te["Avg@5"]
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if epoch == 1 or epoch % 5 == 0:
+        print(f"Epoch {epoch:02d} | loss {tr_loss:.4f} | train_acc {tr_acc:.3f} | "
+              f"Avg@5 {te['Avg@5']:.3f} | AC@1 {te['AC@1']:.3f} | MRR {te['MRR']:.3f}")
+
+if best_state is not None:
+    model.load_state_dict(best_state)
+print("Best Avg@5 =", best_avg5)
+
+# ============================================================
+# 12) Save CSVs + download zip
+# ============================================================
+OUT_DIR = "/content/rca_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+df_cases = evaluate_per_case(model, test_loader)
+summary = evaluate_ac_avg5(model, test_loader)
+
+df_summary = pd.DataFrame([{"metric": k, "value": v} for k, v in summary.items()])
+df_trainlog = pd.DataFrame(train_log)
+
+cases_csv = os.path.join(OUT_DIR, "evaluation_per_case.csv")
+summary_csv = os.path.join(OUT_DIR, "evaluation_summary.csv")
+trainlog_csv = os.path.join(OUT_DIR, "training_log.csv")
+
+df_cases.to_csv(cases_csv, index=False)
+df_summary.to_csv(summary_csv, index=False)
+df_trainlog.to_csv(trainlog_csv, index=False)
+
+print("\nSaved CSVs:")
+print(" -", cases_csv)
+print(" -", summary_csv)
+print(" -", trainlog_csv)
+
+try:
+    from google.colab import files
+    zip_path = "/content/rca_outputs.zip"
+    !zip -j {zip_path} {OUT_DIR}/*.csv
+    files.download(zip_path)
+except Exception as e:
+    print("\n[Note] Auto-download works in Colab only. Download manually from Files pane:", OUT_DIR)
+    print("Error:", repr(e))
+
+display(df_summary)
+display(df_cases.head(10))
